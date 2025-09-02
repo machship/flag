@@ -3,76 +3,99 @@
 // license that can be found in the LICENSE file.
 
 /*
-	Package flag implements command-line flag parsing.
+Package flag implements command-line flag parsing.
 
-	Usage:
+Usage:
 
-	Define flags using flag.String(), Bool(), Int(), etc.
+Define flags using flag.String(), Bool(), Int(), etc.
 
-	This declares an integer flag, -flagname, stored in the pointer ip, with type *int.
-		import "flag"
-		var ip = flag.Int("flagname", 1234, "help message for flagname")
-	If you like, you can bind the flag to a variable using the Var() functions.
-		var flagvar int
-		func init() {
-			flag.IntVar(&flagvar, "flagname", 1234, "help message for flagname")
-		}
-	Or you can create custom flags that satisfy the Value interface (with
-	pointer receivers) and couple them to flag parsing by
-		flag.Var(&flagVal, "name", "help message for flagname")
-	For such flags, the default value is just the initial value of the variable.
+This declares an integer flag, -flagname, stored in the pointer ip, with type *int.
 
-	After all flags are defined, call
-		flag.Parse()
-	to parse the command line into the defined flags.
+	import "flag"
+	var ip = flag.Int("flagname", 1234, "help message for flagname")
 
-	Flags may then be used directly. If you're using the flags themselves,
-	they are all pointers; if you bind to variables, they're values.
-		fmt.Println("ip has value ", *ip)
-		fmt.Println("flagvar has value ", flagvar)
+If you like, you can bind the flag to a variable using the Var() functions.
 
-	After parsing, the arguments following the flags are available as the
-	slice flag.Args() or individually as flag.Arg(i).
-	The arguments are indexed from 0 through flag.NArg()-1.
+	var flagvar int
+	func init() {
+		flag.IntVar(&flagvar, "flagname", 1234, "help message for flagname")
+	}
 
-	Command line flag syntax:
-		-flag
-		-flag=x
-		-flag x  // non-boolean flags only
-	One or two minus signs may be used; they are equivalent.
-	The last form is not permitted for boolean flags because the
-	meaning of the command
-		cmd -x *
-	will change if there is a file called 0, false, etc.  You must
-	use the -flag=false form to turn off a boolean flag.
+Or you can create custom flags that satisfy the Value interface (with
+pointer receivers) and couple them to flag parsing by
 
-	Flag parsing stops just before the first non-flag argument
-	("-" is a non-flag argument) or after the terminator "--".
+	flag.Var(&flagVal, "name", "help message for flagname")
 
-	Integer flags accept 1234, 0664, 0x1234 and may be negative.
-	Boolean flags may be:
-		1, 0, t, f, T, F, true, false, TRUE, FALSE, True, False
-	Duration flags accept any input valid for time.ParseDuration.
+For such flags, the default value is just the initial value of the variable.
 
-	The default set of command-line flags is controlled by
-	top-level functions.  The FlagSet type allows one to define
-	independent sets of flags, such as to implement subcommands
-	in a command-line interface. The methods of FlagSet are
-	analogous to the top-level functions for the command-line
-	flag set.
+After all flags are defined, call
+
+	flag.Parse()
+
+to parse the command line into the defined flags.
+
+Flags may then be used directly. If you're using the flags themselves,
+they are all pointers; if you bind to variables, they're values.
+
+	fmt.Println("ip has value ", *ip)
+	fmt.Println("flagvar has value ", flagvar)
+
+After parsing, the arguments following the flags are available as the
+slice flag.Args() or individually as flag.Arg(i).
+The arguments are indexed from 0 through flag.NArg()-1.
+
+Command line flag syntax:
+
+	-flag
+	-flag=x
+	-flag x  // non-boolean flags only
+
+One or two minus signs may be used; they are equivalent.
+The last form is not permitted for boolean flags because the
+meaning of the command
+
+	cmd -x *
+
+will change if there is a file called 0, false, etc.  You must
+use the -flag=false form to turn off a boolean flag.
+
+Flag parsing stops just before the first non-flag argument
+("-" is a non-flag argument) or after the terminator "--".
+
+Integer flags accept 1234, 0664, 0x1234 and may be negative.
+Boolean flags may be:
+
+	1, 0, t, f, T, F, true, false, TRUE, FALSE, True, False
+
+Duration flags accept any input valid for time.ParseDuration.
+
+The default set of command-line flags is controlled by
+top-level functions.  The FlagSet type allows one to define
+independent sets of flags, such as to implement subcommands
+in a command-line interface. The methods of FlagSet are
+analogous to the top-level functions for the command-line
+flag set.
 */
 package flag
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
+	neturl "net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	decimal "github.com/shopspring/decimal"
 )
 
 // ErrHelp is the error returned if the -help or -h flag is invoked
@@ -231,6 +254,698 @@ func (d *durationValue) Get() interface{} { return time.Duration(*d) }
 
 func (d *durationValue) String() string { return (*time.Duration)(d).String() }
 
+// ---- Extended / custom types ----
+
+// ByteSize represents a size in bytes (supports K, M, G, T suffixes incl. KiB style).
+type ByteSize int64
+
+func parseByteSize(s string) (ByteSize, error) {
+	if s == "" {
+		return 0, nil
+	}
+	// Accept forms: 123, 10k, 5K, 1MB, 2MiB, etc.
+	orig := s
+	s = strings.TrimSpace(s)
+	// Extract numeric prefix
+	i := 0
+	for i < len(s) && (s[i] == '.' || s[i] == '+' || s[i] == '-' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("invalid size: %s", orig)
+	}
+	numStr := s[:i]
+	unit := strings.ToUpper(strings.TrimSpace(s[i:]))
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size number %q: %v", numStr, err)
+	}
+	mult := float64(1)
+	switch unit {
+	case "", "B":
+		mult = 1
+	case "K", "KB":
+		mult = 1000
+	case "KI", "KIB":
+		mult = 1024
+	case "M", "MB":
+		mult = 1000 * 1000
+	case "MI", "MIB":
+		mult = 1024 * 1024
+	case "G", "GB":
+		mult = 1000 * 1000 * 1000
+	case "GI", "GIB":
+		mult = 1024 * 1024 * 1024
+	case "T", "TB":
+		mult = 1000 * 1000 * 1000 * 1000
+	case "TI", "TIB":
+		mult = 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unknown size unit in %q", orig)
+	}
+	return ByteSize(f * mult), nil
+}
+
+type byteSizeValue struct{ p *ByteSize }
+
+func newByteSizeValue(val ByteSize, p *ByteSize) *byteSizeValue {
+	*p = val
+	return &byteSizeValue{p: p}
+}
+func (b *byteSizeValue) Set(s string) error {
+	v, err := parseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b.p = v
+	return nil
+}
+func (b *byteSizeValue) String() string {
+	if b.p == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%d", *b.p)
+}
+func (b *byteSizeValue) Get() interface{} { return *b.p }
+
+// time.Time value with layout
+type timeValue struct {
+	p      *time.Time
+	layout string
+}
+
+func newTimeValue(val time.Time, layout string, p *time.Time) *timeValue {
+	*p = val
+	return &timeValue{p: p, layout: layout}
+}
+func (tv *timeValue) Set(s string) error {
+	t, err := time.Parse(tv.layout, s)
+	if err != nil {
+		return err
+	}
+	*tv.p = t
+	return nil
+}
+func (tv *timeValue) String() string {
+	if tv.p == nil || tv.p.IsZero() {
+		return ""
+	}
+	return tv.p.Format(tv.layout)
+}
+func (tv *timeValue) Get() interface{} { return *tv.p }
+
+// decimal.Decimal
+type decimalValue struct{ p *decimal.Decimal }
+
+func newDecimalValue(val decimal.Decimal, p *decimal.Decimal) *decimalValue {
+	*p = val
+	return &decimalValue{p: p}
+}
+func (dv *decimalValue) Set(s string) error {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		return err
+	}
+	*dv.p = d
+	return nil
+}
+func (dv *decimalValue) String() string {
+	if dv.p == nil {
+		return "0"
+	}
+	return dv.p.String()
+}
+func (dv *decimalValue) Get() interface{} { return *dv.p }
+
+// net.IP
+type ipValue struct{ p *net.IP }
+
+func newIPValue(val net.IP, p *net.IP) *ipValue { *p = val; return &ipValue{p: p} }
+func (iv *ipValue) Set(s string) error {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return fmt.Errorf("invalid IP %q", s)
+	}
+	*iv.p = ip
+	return nil
+}
+func (iv *ipValue) String() string {
+	if iv.p == nil || *iv.p == nil {
+		return ""
+	}
+	return iv.p.String()
+}
+func (iv *ipValue) Get() interface{} { return *iv.p }
+
+// net.IPNet
+type ipNetValue struct{ p *net.IPNet }
+
+func newIPNetValue(val *net.IPNet, p *net.IPNet) *ipNetValue {
+	if val != nil {
+		*p = *val
+	}
+	return &ipNetValue{p: p}
+}
+func (nv *ipNetValue) Set(s string) error {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		return err
+	}
+	*nv.p = *n
+	return nil
+}
+func (nv *ipNetValue) String() string {
+	if nv.p == nil || nv.p.IP == nil {
+		return ""
+	}
+	return nv.p.String()
+}
+func (nv *ipNetValue) Get() interface{} { return *nv.p }
+
+// url.URL
+type urlValue struct{ p *neturl.URL }
+
+func newURLValue(val *neturl.URL, p *neturl.URL) *urlValue {
+	if val != nil {
+		*p = *val
+	}
+	return &urlValue{p: p}
+}
+func (uv *urlValue) Set(s string) error {
+	u, err := neturl.Parse(s)
+	if err != nil {
+		return err
+	}
+	*uv.p = *u
+	return nil
+}
+func (uv *urlValue) String() string {
+	if uv.p == nil || uv.p.Host == "" {
+		return ""
+	}
+	return uv.p.String()
+}
+func (uv *urlValue) Get() interface{} { return *uv.p }
+
+// uuid.UUID
+type uuidValue struct{ p *uuid.UUID }
+
+func newUUIDValue(val uuid.UUID, p *uuid.UUID) *uuidValue { *p = val; return &uuidValue{p: p} }
+func (uv *uuidValue) Set(s string) error {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return err
+	}
+	*uv.p = id
+	return nil
+}
+func (uv *uuidValue) String() string {
+	if uv.p == nil {
+		return ""
+	}
+	return uv.p.String()
+}
+func (uv *uuidValue) Get() interface{} { return *uv.p }
+
+// big.Int
+type bigIntValue struct{ p *big.Int }
+
+func newBigIntValue(val *big.Int, p *big.Int) *bigIntValue {
+	if val != nil {
+		p.Set(val)
+	}
+	return &bigIntValue{p: p}
+}
+func (bv *bigIntValue) Set(s string) error {
+	if _, ok := bv.p.SetString(s, 0); !ok {
+		return fmt.Errorf("invalid big.Int %q", s)
+	}
+	return nil
+}
+func (bv *bigIntValue) String() string {
+	if bv.p == nil {
+		return "0"
+	}
+	return bv.p.String()
+}
+func (bv *bigIntValue) Get() interface{} { return *bv.p }
+
+// big.Rat
+type bigRatValue struct{ p *big.Rat }
+
+func newBigRatValue(val *big.Rat, p *big.Rat) *bigRatValue {
+	if val != nil {
+		p.Set(val)
+	}
+	return &bigRatValue{p: p}
+}
+func (rv *bigRatValue) Set(s string) error {
+	if _, ok := rv.p.SetString(s); !ok {
+		return fmt.Errorf("invalid big.Rat %q", s)
+	}
+	return nil
+}
+func (rv *bigRatValue) String() string {
+	if rv.p == nil {
+		return "0"
+	}
+	return rv.p.RatString()
+}
+func (rv *bigRatValue) Get() interface{} { return *rv.p }
+
+// regexp
+type regexpValue struct{ p **regexp.Regexp }
+
+func newRegexpValue(val *regexp.Regexp, p **regexp.Regexp) *regexpValue {
+	*p = val
+	return &regexpValue{p: p}
+}
+func (rv *regexpValue) Set(s string) error {
+	r, err := regexp.Compile(s)
+	if err != nil {
+		return err
+	}
+	*rv.p = r
+	return nil
+}
+func (rv *regexpValue) String() string {
+	if rv.p == nil || *rv.p == nil {
+		return ""
+	}
+	return (*rv.p).String()
+}
+func (rv *regexpValue) Get() interface{} {
+	if rv.p == nil || *rv.p == nil {
+		return nil
+	}
+	return *rv.p
+}
+
+// string slice
+type stringSliceValue struct {
+	p   *[]string
+	sep string
+}
+
+func newStringSliceValue(val []string, sep string, p *[]string) *stringSliceValue {
+	*p = append((*p)[:0], val...)
+	return &stringSliceValue{p: p, sep: sep}
+}
+func (sv *stringSliceValue) Set(s string) error {
+	parts := strings.Split(s, sv.sep)
+	*sv.p = append((*sv.p)[:0], parts...)
+	return nil
+}
+func (sv *stringSliceValue) String() string {
+	if sv.p == nil {
+		return ""
+	}
+	return strings.Join(*sv.p, sv.sep)
+}
+func (sv *stringSliceValue) Get() interface{} { return *sv.p }
+
+// duration slice
+type durationSliceValue struct {
+	p   *[]time.Duration
+	sep string
+}
+
+func newDurationSliceValue(val []time.Duration, sep string, p *[]time.Duration) *durationSliceValue {
+	*p = append((*p)[:0], val...)
+	return &durationSliceValue{p: p, sep: sep}
+}
+func (dv *durationSliceValue) Set(s string) error {
+	parts := strings.Split(s, dv.sep)
+	out := make([]time.Duration, 0, len(parts))
+	for _, part := range parts {
+		d, err := time.ParseDuration(strings.TrimSpace(part))
+		if err != nil {
+			return err
+		}
+		out = append(out, d)
+	}
+	*dv.p = out
+	return nil
+}
+func (dv *durationSliceValue) String() string {
+	if dv.p == nil {
+		return ""
+	}
+	var ss []string
+	for _, d := range *dv.p {
+		ss = append(ss, d.String())
+	}
+	return strings.Join(ss, dv.sep)
+}
+func (dv *durationSliceValue) Get() interface{} { return *dv.p }
+
+// map[string]string (comma separated key=value list)
+type stringMapValue struct{ p *map[string]string }
+
+func newStringMapValue(val map[string]string, p *map[string]string) *stringMapValue {
+	*p = val
+	return &stringMapValue{p: p}
+}
+func (mv *stringMapValue) Set(s string) error {
+	m := make(map[string]string)
+	if strings.TrimSpace(s) != "" {
+		pairs := strings.Split(s, ",")
+		for _, p := range pairs {
+			kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+			if len(kv) != 2 {
+				return fmt.Errorf("invalid map entry %q", p)
+			}
+			m[kv[0]] = kv[1]
+		}
+	}
+	*mv.p = m
+	return nil
+}
+func (mv *stringMapValue) String() string {
+	if mv.p == nil {
+		return ""
+	}
+	var parts []string
+	for k, v := range *mv.p {
+		parts = append(parts, k+"="+v)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+func (mv *stringMapValue) Get() interface{} { return *mv.p }
+
+// json.RawMessage
+type jsonValue struct{ p *json.RawMessage }
+
+func newJSONValue(val json.RawMessage, p *json.RawMessage) *jsonValue {
+	*p = val
+	return &jsonValue{p: p}
+}
+func (jv *jsonValue) Set(s string) error {
+	var tmp json.RawMessage = json.RawMessage([]byte(s)) // basic validation
+	var v interface{}
+	if err := json.Unmarshal(tmp, &v); err != nil {
+		return err
+	}
+	*jv.p = tmp
+	return nil
+}
+func (jv *jsonValue) String() string {
+	if jv.p == nil {
+		return ""
+	}
+	return string(*jv.p)
+}
+func (jv *jsonValue) Get() interface{} { return *jv.p }
+
+// enum string wrapper
+type enumStringValue struct {
+	p       *string
+	allowed map[string]struct{}
+}
+
+func newEnumStringValue(def string, allowed []string, p *string) *enumStringValue {
+	*p = def
+	m := make(map[string]struct{}, len(allowed))
+	for _, a := range allowed {
+		m[a] = struct{}{}
+	}
+	return &enumStringValue{p: p, allowed: m}
+}
+func (ev *enumStringValue) Set(s string) error {
+	if _, ok := ev.allowed[s]; !ok {
+		return fmt.Errorf("invalid value %q (allowed: %s)", s, keys(ev.allowed))
+	}
+	*ev.p = s
+	return nil
+}
+func (ev *enumStringValue) String() string {
+	if ev.p == nil {
+		return ""
+	}
+	return *ev.p
+}
+func (ev *enumStringValue) Get() interface{} { return *ev.p }
+
+func keys(m map[string]struct{}) string {
+	var ks []string
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return strings.Join(ks, ",")
+}
+
+// Helper registration methods for extended types
+func (f *FlagSet) ByteSizeVar(p *ByteSize, name string, value ByteSize, usage string) {
+	f.Var(newByteSizeValue(value, p), name, usage)
+}
+func ByteSizeVar(p *ByteSize, name string, value ByteSize, usage string) {
+	CommandLine.Var(newByteSizeValue(value, p), name, usage)
+}
+
+// ByteSizeFlag defines a ByteSize flag and returns a pointer to it.
+func (f *FlagSet) ByteSizeFlag(name string, value ByteSize, usage string) *ByteSize {
+	p := new(ByteSize)
+	f.ByteSizeVar(p, name, value, usage)
+	return p
+}
+func ByteSizeFlag(name string, value ByteSize, usage string) *ByteSize {
+	return CommandLine.ByteSizeFlag(name, value, usage)
+}
+
+func (f *FlagSet) TimeVar(p *time.Time, name, layout string, value time.Time, usage string) {
+	if layout == "" {
+		layout = time.RFC3339
+	}
+	f.Var(newTimeValue(value, layout, p), name, usage)
+}
+func TimeVar(p *time.Time, name, layout string, value time.Time, usage string) {
+	CommandLine.TimeVar(p, name, layout, value, usage)
+}
+func (f *FlagSet) Time(name, layout string, value time.Time, usage string) *time.Time {
+	p := new(time.Time)
+	f.TimeVar(p, name, layout, value, usage)
+	return p
+}
+func Time(name, layout string, value time.Time, usage string) *time.Time {
+	return CommandLine.Time(name, layout, value, usage)
+}
+
+func (f *FlagSet) DecimalVar(p *decimal.Decimal, name string, value decimal.Decimal, usage string) {
+	f.Var(newDecimalValue(value, p), name, usage)
+}
+func DecimalVar(p *decimal.Decimal, name string, value decimal.Decimal, usage string) {
+	CommandLine.DecimalVar(p, name, value, usage)
+}
+func (f *FlagSet) Decimal(name string, value decimal.Decimal, usage string) *decimal.Decimal {
+	p := new(decimal.Decimal)
+	f.DecimalVar(p, name, value, usage)
+	return p
+}
+func Decimal(name string, value decimal.Decimal, usage string) *decimal.Decimal {
+	return CommandLine.Decimal(name, value, usage)
+}
+
+func (f *FlagSet) IPVar(p *net.IP, name string, value net.IP, usage string) {
+	f.Var(newIPValue(value, p), name, usage)
+}
+func IPVar(p *net.IP, name string, value net.IP, usage string) {
+	CommandLine.IPVar(p, name, value, usage)
+}
+func (f *FlagSet) IP(name string, value net.IP, usage string) *net.IP {
+	p := new(net.IP)
+	f.IPVar(p, name, value, usage)
+	return p
+}
+func IP(name string, value net.IP, usage string) *net.IP { return CommandLine.IP(name, value, usage) }
+
+func (f *FlagSet) IPNetVar(p *net.IPNet, name string, value *net.IPNet, usage string) {
+	f.Var(newIPNetValue(value, p), name, usage)
+}
+func IPNetVar(p *net.IPNet, name string, value *net.IPNet, usage string) {
+	CommandLine.IPNetVar(p, name, value, usage)
+}
+func (f *FlagSet) IPNet(name string, value *net.IPNet, usage string) *net.IPNet {
+	p := new(net.IPNet)
+	f.IPNetVar(p, name, value, usage)
+	return p
+}
+func IPNet(name string, value *net.IPNet, usage string) *net.IPNet {
+	return CommandLine.IPNet(name, value, usage)
+}
+
+func (f *FlagSet) URLVar(p *neturl.URL, name string, value *neturl.URL, usage string) {
+	f.Var(newURLValue(value, p), name, usage)
+}
+func URLVar(p *neturl.URL, name string, value *neturl.URL, usage string) {
+	CommandLine.URLVar(p, name, value, usage)
+}
+func (f *FlagSet) URL(name string, value *neturl.URL, usage string) *neturl.URL {
+	p := new(neturl.URL)
+	f.URLVar(p, name, value, usage)
+	return p
+}
+func URL(name string, value *neturl.URL, usage string) *neturl.URL {
+	return CommandLine.URL(name, value, usage)
+}
+
+func (f *FlagSet) UUIDVar(p *uuid.UUID, name string, value uuid.UUID, usage string) {
+	f.Var(newUUIDValue(value, p), name, usage)
+}
+func UUIDVar(p *uuid.UUID, name string, value uuid.UUID, usage string) {
+	CommandLine.UUIDVar(p, name, value, usage)
+}
+func (f *FlagSet) UUID(name string, value uuid.UUID, usage string) *uuid.UUID {
+	p := new(uuid.UUID)
+	f.UUIDVar(p, name, value, usage)
+	return p
+}
+func UUID(name string, value uuid.UUID, usage string) *uuid.UUID {
+	return CommandLine.UUID(name, value, usage)
+}
+
+func (f *FlagSet) BigIntVar(p *big.Int, name string, value *big.Int, usage string) {
+	if value == nil {
+		value = big.NewInt(0)
+	}
+	f.Var(newBigIntValue(value, p), name, usage)
+}
+func BigIntVar(p *big.Int, name string, value *big.Int, usage string) {
+	CommandLine.BigIntVar(p, name, value, usage)
+}
+func (f *FlagSet) BigInt(name string, value *big.Int, usage string) *big.Int {
+	p := new(big.Int)
+	f.BigIntVar(p, name, value, usage)
+	return p
+}
+func BigInt(name string, value *big.Int, usage string) *big.Int {
+	return CommandLine.BigInt(name, value, usage)
+}
+
+func (f *FlagSet) BigRatVar(p *big.Rat, name string, value *big.Rat, usage string) {
+	if value == nil {
+		value = big.NewRat(0, 1)
+	}
+	f.Var(newBigRatValue(value, p), name, usage)
+}
+func BigRatVar(p *big.Rat, name string, value *big.Rat, usage string) {
+	CommandLine.BigRatVar(p, name, value, usage)
+}
+func (f *FlagSet) BigRat(name string, value *big.Rat, usage string) *big.Rat {
+	p := new(big.Rat)
+	f.BigRatVar(p, name, value, usage)
+	return p
+}
+func BigRat(name string, value *big.Rat, usage string) *big.Rat {
+	return CommandLine.BigRat(name, value, usage)
+}
+
+func (f *FlagSet) RegexpVar(p **regexp.Regexp, name string, value *regexp.Regexp, usage string) {
+	f.Var(newRegexpValue(value, p), name, usage)
+}
+func RegexpVar(p **regexp.Regexp, name string, value *regexp.Regexp, usage string) {
+	CommandLine.RegexpVar(p, name, value, usage)
+}
+func (f *FlagSet) Regexp(name string, value *regexp.Regexp, usage string) **regexp.Regexp {
+	p := new(*regexp.Regexp)
+	f.RegexpVar(p, name, value, usage)
+	return p
+}
+func Regexp(name string, value *regexp.Regexp, usage string) **regexp.Regexp {
+	return CommandLine.Regexp(name, value, usage)
+}
+
+func (f *FlagSet) StringSliceVar(p *[]string, name, sep string, value []string, usage string) {
+	if sep == "" {
+		sep = ","
+	}
+	f.Var(newStringSliceValue(value, sep, p), name, usage)
+}
+func StringSliceVar(p *[]string, name, sep string, value []string, usage string) {
+	CommandLine.StringSliceVar(p, name, sep, value, usage)
+}
+func (f *FlagSet) StringSlice(name, sep string, value []string, usage string) *[]string {
+	p := new([]string)
+	f.StringSliceVar(p, name, sep, value, usage)
+	return p
+}
+func StringSlice(name, sep string, value []string, usage string) *[]string {
+	return CommandLine.StringSlice(name, sep, value, usage)
+}
+
+func (f *FlagSet) DurationSliceVar(p *[]time.Duration, name, sep string, value []time.Duration, usage string) {
+	if sep == "" {
+		sep = ","
+	}
+	f.Var(newDurationSliceValue(value, sep, p), name, usage)
+}
+func DurationSliceVar(p *[]time.Duration, name, sep string, value []time.Duration, usage string) {
+	CommandLine.DurationSliceVar(p, name, sep, value, usage)
+}
+func (f *FlagSet) DurationSlice(name, sep string, value []time.Duration, usage string) *[]time.Duration {
+	p := new([]time.Duration)
+	f.DurationSliceVar(p, name, sep, value, usage)
+	return p
+}
+func DurationSlice(name, sep string, value []time.Duration, usage string) *[]time.Duration {
+	return CommandLine.DurationSlice(name, sep, value, usage)
+}
+
+func (f *FlagSet) StringMapVar(p *map[string]string, name string, value map[string]string, usage string) {
+	f.Var(newStringMapValue(value, p), name, usage)
+}
+func StringMapVar(p *map[string]string, name string, value map[string]string, usage string) {
+	CommandLine.StringMapVar(p, name, value, usage)
+}
+func (f *FlagSet) StringMap(name string, value map[string]string, usage string) *map[string]string {
+	p := new(map[string]string)
+	f.StringMapVar(p, name, value, usage)
+	return p
+}
+func StringMap(name string, value map[string]string, usage string) *map[string]string {
+	return CommandLine.StringMap(name, value, usage)
+}
+
+func (f *FlagSet) JSONVar(p *json.RawMessage, name string, value json.RawMessage, usage string) {
+	f.Var(newJSONValue(value, p), name, usage)
+}
+func JSONVar(p *json.RawMessage, name string, value json.RawMessage, usage string) {
+	CommandLine.JSONVar(p, name, value, usage)
+}
+func (f *FlagSet) JSON(name string, value json.RawMessage, usage string) *json.RawMessage {
+	p := new(json.RawMessage)
+	f.JSONVar(p, name, value, usage)
+	return p
+}
+func JSON(name string, value json.RawMessage, usage string) *json.RawMessage {
+	return CommandLine.JSON(name, value, usage)
+}
+
+// EnumVar registers an enum string flag restricted to the provided allowed values.
+func (f *FlagSet) EnumVar(p *string, name string, value string, allowed []string, usage string) {
+	// Normalize allowed list (trim spaces)
+	norm := make([]string, 0, len(allowed))
+	for _, a := range allowed {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			norm = append(norm, a)
+		}
+	}
+	f.Var(newEnumStringValue(value, norm, p), name, usage)
+}
+func EnumVar(p *string, name string, value string, allowed []string, usage string) {
+	CommandLine.EnumVar(p, name, value, allowed, usage)
+}
+func (f *FlagSet) Enum(name string, value string, allowed []string, usage string) *string {
+	p := new(string)
+	f.EnumVar(p, name, value, allowed, usage)
+	return p
+}
+func Enum(name string, value string, allowed []string, usage string) *string {
+	return CommandLine.Enum(name, value, allowed, usage)
+}
+
 // Value is the interface to the dynamic value stored in a flag.
 // (The default value is represented as a string.)
 //
@@ -251,6 +966,228 @@ type Value interface {
 type Getter interface {
 	Value
 	Get() interface{}
+}
+
+// Var defines a flag with the specified name and usage string. The type and
+// value of the flag are represented by the first argument, of type Value, which
+// typically holds a user-defined implementation of Value. For instance, the
+// caller could create a flag that turns a comma-separated string into a slice
+// of strings by giving the slice the methods of Value; in particular, Set would
+// decompose the comma-separated string into the slice.
+func (f *FlagSet) Var(value Value, name string, usage string) {
+	// Remember the default value as a string; it won't change.
+	flag := &Flag{name, usage, value, value.String()}
+	_, alreadythere := f.formal[name]
+	if alreadythere {
+		var msg string
+		if f.name == "" {
+			msg = fmt.Sprintf("flag redefined: %s", name)
+		} else {
+			msg = fmt.Sprintf("%s flag redefined: %s", f.name, name)
+		}
+		fmt.Fprintln(f.out(), msg)
+		panic(msg) // Happens only if flags are declared with identical names
+	}
+	if f.formal == nil {
+		f.formal = make(map[string]*Flag)
+	}
+	f.formal[name] = flag
+}
+
+// Var defines a flag with the specified name and usage string. The type and
+// value of the flag are represented by the first argument, of type Value, which
+// typically holds a user-defined implementation of Value. For instance, the
+// caller could create a flag that turns a comma-separated string into a slice
+// of strings by giving the slice the methods of Value; in particular, Set would
+// decompose the comma-separated string into the slice.
+func Var(value Value, name string, usage string) { CommandLine.Var(value, name, usage) }
+
+// failf prints to standard error a formatted error and usage message and
+// returns the error.
+func (f *FlagSet) failf(format string, a ...interface{}) error {
+	err := fmt.Errorf(format, a...)
+	fmt.Fprintln(f.out(), err)
+	f.usage()
+	return err
+}
+
+// usage calls the Usage method for the flag set if one is specified,
+// or the appropriate default usage function otherwise.
+func (f *FlagSet) usage() {
+	if f.Usage == nil {
+		if f == CommandLine {
+			Usage()
+		} else {
+			defaultUsage(f)
+		}
+	} else {
+		f.Usage()
+	}
+}
+
+// parseOne parses one flag. It reports whether a flag was seen.
+func (f *FlagSet) parseOne() (bool, error) {
+	if len(f.args) == 0 {
+		return false, nil
+	}
+	s := f.args[0]
+	if len(s) == 0 || s[0] != '-' || len(s) == 1 {
+		return false, nil
+	}
+	numMinuses := 1
+	if s[1] == '-' {
+		numMinuses++
+		if len(s) == 2 { // "--" terminates the flags
+			f.args = f.args[1:]
+			return false, nil
+		}
+	}
+	name := s[numMinuses:]
+	if len(name) == 0 || name[0] == '-' || name[0] == '=' {
+		return false, f.failf("bad flag syntax: %s", s)
+	}
+	// ignore go test flags
+	if strings.HasPrefix(name, "test.") {
+		return false, nil
+	}
+	// it's a flag. does it have an argument?
+	f.args = f.args[1:]
+	hasValue := false
+	value := ""
+	for i := 1; i < len(name); i++ { // equals cannot be first
+		if name[i] == '=' {
+			value = name[i+1:]
+			hasValue = true
+			name = name[0:i]
+			break
+		}
+	}
+	m := f.formal
+	flag, alreadythere := m[name]
+	if !alreadythere {
+		if name == "help" || name == "h" {
+			f.usage()
+			return false, ErrHelp
+		}
+		return false, f.failf("flag provided but not defined: -%s", name)
+	}
+	if fv, ok := flag.Value.(boolFlag); ok && fv.IsBoolFlag() { // special case: doesn't need an arg
+		if hasValue {
+			if err := fv.Set(value); err != nil {
+				return false, f.failf("invalid boolean value %q for -%s: %v", value, name, err)
+			}
+		} else {
+			if err := fv.Set("true"); err != nil {
+				return false, f.failf("invalid boolean flag %s: %v", name, err)
+			}
+		}
+	} else {
+		// It must have a value, which might be the next argument.
+		if !hasValue && len(f.args) > 0 {
+			hasValue = true
+			value, f.args = f.args[0], f.args[1:]
+		}
+		if !hasValue {
+			return false, f.failf("flag needs an argument: -%s", name)
+		}
+		if err := flag.Value.Set(value); err != nil {
+			return false, f.failf("invalid value %q for flag -%s: %v", value, name, err)
+		}
+	}
+	if f.actual == nil {
+		f.actual = make(map[string]*Flag)
+	}
+	f.actual[name] = flag
+	return true, nil
+}
+
+// Parse parses flag definitions from the argument list, which should not
+// include the command name. Must be called after all flags in the FlagSet
+// are defined and before flags are accessed by the program.
+// The return value will be ErrHelp if -help or -h were set but not defined.
+func (f *FlagSet) Parse(arguments []string) error {
+	f.parsed = true
+	f.args = arguments
+	for {
+		seen, err := f.parseOne()
+		if seen {
+			continue
+		}
+		if err == nil {
+			break
+		}
+		switch f.errorHandling {
+		case ContinueOnError:
+			return err
+		case ExitOnError:
+			os.Exit(2)
+		case PanicOnError:
+			panic(err)
+		}
+	}
+	if err := f.ParseEnv(os.Environ()); err != nil {
+		switch f.errorHandling {
+		case ContinueOnError:
+			return err
+		case ExitOnError:
+			os.Exit(2)
+		case PanicOnError:
+			panic(err)
+		}
+		return err
+	}
+	var cFile string
+	if cf := f.formal[DefaultConfigFlagname]; cf != nil {
+		cFile = cf.Value.String()
+	}
+	if cf := f.actual[DefaultConfigFlagname]; cf != nil {
+		cFile = cf.Value.String()
+	}
+	if cFile != "" {
+		if err := f.ParseFile(cFile); err != nil {
+			switch f.errorHandling {
+			case ContinueOnError:
+				return err
+			case ExitOnError:
+				os.Exit(2)
+			case PanicOnError:
+				panic(err)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// Parsed reports whether f.Parse has been called.
+func (f *FlagSet) Parsed() bool { return f.parsed }
+
+// Parse parses the command-line flags from os.Args[1:].  Must be called
+// after all flags are defined and before flags are accessed by the program.
+func Parse() { CommandLine.Parse(os.Args[1:]) }
+
+// Parsed reports whether the command-line flags have been parsed.
+func Parsed() bool { return CommandLine.Parsed() }
+
+// CommandLine is the default set of command-line flags, parsed from os.Args.
+// The top-level functions such as BoolVar, Arg, and so on are wrappers for the
+// methods of CommandLine.
+var CommandLine = NewFlagSet(os.Args[0], ExitOnError)
+
+// NewFlagSet returns a new, empty flag set with the specified name and
+// error handling property.
+func NewFlagSet(name string, errorHandling ErrorHandling) *FlagSet {
+	f := &FlagSet{name: name, errorHandling: errorHandling}
+	return f
+}
+
+// Init sets the name and error handling property for a flag set.
+// By default, the zero FlagSet uses an empty name, EnvironmentPrefix, and the
+// ContinueOnError error handling policy.
+func (f *FlagSet) Init(name string, errorHandling ErrorHandling) {
+	f.name = name
+	f.envPrefix = EnvironmentPrefix
+	f.errorHandling = errorHandling
 }
 
 // ErrorHandling defines how FlagSet.Parse behaves if the parse fails.
@@ -482,8 +1419,10 @@ func (f *FlagSet) PrintDefaults() {
 // a usage message showing the default settings of all defined
 // command-line flags.
 // For an integer valued flag x, the default output has the form
+//
 //	-x int
 //		usage-message-for-x (default 7)
+//
 // The usage message will appear on a separate line for anything but
 // a bool flag with a one-byte name. For bool flags, the type is
 // omitted and if the flag name is one byte the usage message appears
@@ -493,8 +1432,11 @@ func (f *FlagSet) PrintDefaults() {
 // string; the first such item in the message is taken to be a parameter
 // name to show in the message and the back quotes are stripped from
 // the message when displayed. For instance, given
+//
 //	flag.String("I", "", "search `directory` for include files")
+//
 // the output will be
+//
 //	-I directory
 //		search directory for include files.
 func PrintDefaults() {
@@ -770,246 +1712,4 @@ func (f *FlagSet) Duration(name string, value time.Duration, usage string) *time
 // The flag accepts a value acceptable to time.ParseDuration.
 func Duration(name string, value time.Duration, usage string) *time.Duration {
 	return CommandLine.Duration(name, value, usage)
-}
-
-// Var defines a flag with the specified name and usage string. The type and
-// value of the flag are represented by the first argument, of type Value, which
-// typically holds a user-defined implementation of Value. For instance, the
-// caller could create a flag that turns a comma-separated string into a slice
-// of strings by giving the slice the methods of Value; in particular, Set would
-// decompose the comma-separated string into the slice.
-func (f *FlagSet) Var(value Value, name string, usage string) {
-	// Remember the default value as a string; it won't change.
-	flag := &Flag{name, usage, value, value.String()}
-	_, alreadythere := f.formal[name]
-	if alreadythere {
-		var msg string
-		if f.name == "" {
-			msg = fmt.Sprintf("flag redefined: %s", name)
-		} else {
-			msg = fmt.Sprintf("%s flag redefined: %s", f.name, name)
-		}
-		fmt.Fprintln(f.out(), msg)
-		panic(msg) // Happens only if flags are declared with identical names
-	}
-	if f.formal == nil {
-		f.formal = make(map[string]*Flag)
-	}
-	f.formal[name] = flag
-}
-
-// Var defines a flag with the specified name and usage string. The type and
-// value of the flag are represented by the first argument, of type Value, which
-// typically holds a user-defined implementation of Value. For instance, the
-// caller could create a flag that turns a comma-separated string into a slice
-// of strings by giving the slice the methods of Value; in particular, Set would
-// decompose the comma-separated string into the slice.
-func Var(value Value, name string, usage string) {
-	CommandLine.Var(value, name, usage)
-}
-
-// failf prints to standard error a formatted error and usage message and
-// returns the error.
-func (f *FlagSet) failf(format string, a ...interface{}) error {
-	err := fmt.Errorf(format, a...)
-	fmt.Fprintln(f.out(), err)
-	f.usage()
-	return err
-}
-
-// usage calls the Usage method for the flag set if one is specified,
-// or the appropriate default usage function otherwise.
-func (f *FlagSet) usage() {
-	if f.Usage == nil {
-		if f == CommandLine {
-			Usage()
-		} else {
-			defaultUsage(f)
-		}
-	} else {
-		f.Usage()
-	}
-}
-
-// parseOne parses one flag. It reports whether a flag was seen.
-func (f *FlagSet) parseOne() (bool, error) {
-	if len(f.args) == 0 {
-		return false, nil
-	}
-	s := f.args[0]
-	if len(s) == 0 || s[0] != '-' || len(s) == 1 {
-		return false, nil
-	}
-	numMinuses := 1
-	if s[1] == '-' {
-		numMinuses++
-		if len(s) == 2 { // "--" terminates the flags
-			f.args = f.args[1:]
-			return false, nil
-		}
-	}
-	name := s[numMinuses:]
-	if len(name) == 0 || name[0] == '-' || name[0] == '=' {
-		return false, f.failf("bad flag syntax: %s", s)
-	}
-
-	// ignore go test flags
-	if strings.HasPrefix(name, "test.") {
-		return false, nil
-	}
-
-	// it's a flag. does it have an argument?
-	f.args = f.args[1:]
-	hasValue := false
-	value := ""
-	for i := 1; i < len(name); i++ { // equals cannot be first
-		if name[i] == '=' {
-			value = name[i+1:]
-			hasValue = true
-			name = name[0:i]
-			break
-		}
-	}
-	m := f.formal
-	flag, alreadythere := m[name] // BUG
-	if !alreadythere {
-		if name == "help" || name == "h" { // special case for nice help message.
-			f.usage()
-			return false, ErrHelp
-		}
-		return false, f.failf("flag provided but not defined: -%s", name)
-	}
-	if fv, ok := flag.Value.(boolFlag); ok && fv.IsBoolFlag() { // special case: doesn't need an arg
-		if hasValue {
-			if err := fv.Set(value); err != nil {
-				return false, f.failf("invalid boolean value %q for -%s: %v", value, name, err)
-			}
-		} else {
-			if err := fv.Set("true"); err != nil {
-				return false, f.failf("invalid boolean flag %s: %v", name, err)
-			}
-		}
-	} else {
-		// It must have a value, which might be the next argument.
-		if !hasValue && len(f.args) > 0 {
-			// value is the next arg
-			hasValue = true
-			value, f.args = f.args[0], f.args[1:]
-		}
-		if !hasValue {
-			return false, f.failf("flag needs an argument: -%s", name)
-		}
-		if err := flag.Value.Set(value); err != nil {
-			return false, f.failf("invalid value %q for flag -%s: %v", value, name, err)
-		}
-	}
-	if f.actual == nil {
-		f.actual = make(map[string]*Flag)
-	}
-	f.actual[name] = flag
-	return true, nil
-}
-
-// Parse parses flag definitions from the argument list, which should not
-// include the command name. Must be called after all flags in the FlagSet
-// are defined and before flags are accessed by the program.
-// The return value will be ErrHelp if -help or -h were set but not defined.
-func (f *FlagSet) Parse(arguments []string) error {
-	f.parsed = true
-	f.args = arguments
-	for {
-		seen, err := f.parseOne()
-		if seen {
-			continue
-		}
-		if err == nil {
-			break
-		}
-		switch f.errorHandling {
-		case ContinueOnError:
-			return err
-		case ExitOnError:
-			os.Exit(2)
-		case PanicOnError:
-			panic(err)
-		}
-	}
-
-	// Parse environment variables
-	if err := f.ParseEnv(os.Environ()); err != nil {
-		switch f.errorHandling {
-		case ContinueOnError:
-			return err
-		case ExitOnError:
-			os.Exit(2)
-		case PanicOnError:
-			panic(err)
-		}
-		return err
-	}
-
-	// Parse configuration from file
-	var cFile string
-	if cf := f.formal[DefaultConfigFlagname]; cf != nil {
-		cFile = cf.Value.String()
-	}
-	if cf := f.actual[DefaultConfigFlagname]; cf != nil {
-		cFile = cf.Value.String()
-	}
-	if cFile != "" {
-		if err := f.ParseFile(cFile); err != nil {
-			switch f.errorHandling {
-			case ContinueOnError:
-				return err
-			case ExitOnError:
-				os.Exit(2)
-			case PanicOnError:
-				panic(err)
-			}
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Parsed reports whether f.Parse has been called.
-func (f *FlagSet) Parsed() bool {
-	return f.parsed
-}
-
-// Parse parses the command-line flags from os.Args[1:].  Must be called
-// after all flags are defined and before flags are accessed by the program.
-func Parse() {
-	// Ignore errors; CommandLine is set for ExitOnError.
-	CommandLine.Parse(os.Args[1:])
-}
-
-// Parsed reports whether the command-line flags have been parsed.
-func Parsed() bool {
-	return CommandLine.Parsed()
-}
-
-// CommandLine is the default set of command-line flags, parsed from os.Args.
-// The top-level functions such as BoolVar, Arg, and so on are wrappers for the
-// methods of CommandLine.
-var CommandLine = NewFlagSet(os.Args[0], ExitOnError)
-
-// NewFlagSet returns a new, empty flag set with the specified name and
-// error handling property.
-func NewFlagSet(name string, errorHandling ErrorHandling) *FlagSet {
-	f := &FlagSet{
-		name:          name,
-		errorHandling: errorHandling,
-	}
-	return f
-}
-
-// Init sets the name and error handling property for a flag set.
-// By default, the zero FlagSet uses an empty name, EnvironmentPrefix, and the
-// ContinueOnError error handling policy.
-func (f *FlagSet) Init(name string, errorHandling ErrorHandling) {
-	f.name = name
-	f.envPrefix = EnvironmentPrefix
-	f.errorHandling = errorHandling
 }
