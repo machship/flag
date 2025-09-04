@@ -56,15 +56,19 @@ echo 'age 3' > cfg.conf; go run main.go -config cfg.conf   # File
 
 Supported struct tags:
 
-| Tag       | Purpose | Example |
-|-----------|---------|---------|
-| `flag`    | Flag name (required to participate) | ``Host string `flag:"host"` `` |
-| `default` | Default value (ignored if `required:"true"`) | ``Port int `flag:"port" default:"8080"` `` |
-| `help`    | Usage/help text | ``Debug bool `flag:"debug" help:"enable debug"` `` |
-| `required`| Mark as required (`true`/`false`) | ``APIKey string `flag:"api-key" required:"true"` `` |
-| `enum`    | Comma list of allowed values (string only) | ``Mode string `flag:"mode" enum:"dev,staging,prod"` `` |
-| `sep`     | Separator for slice flags (default ",") | ``List []string `flag:"list" default:"a,b" sep:";"` `` |
-| `layout`  | `time.Time` parse layout (default RFC3339) | ``Start time.Time `flag:"start" layout:"2006-01-02"` `` |
+| Tag        | Purpose | Example |
+|------------|---------|---------|
+| `flag`     | Flag name (required to participate) | ``Host string `flag:"host"` `` |
+| `default`  | Default value (ignored if `required:"true"`) | ``Port int `flag:"port" default:"8080"` `` |
+| `help`     | Usage/help text | ``Debug bool `flag:"debug" help:"enable debug"` `` |
+| `required` | Mark as required (`true`/`false`) | ``APIKey string `flag:"api-key" required:"true"` `` |
+| `enum`     | Comma list of allowed values (string only) | ``Mode string `flag:"mode" enum:"dev,staging,prod"` `` |
+| `sep`      | Separator for slice flags (default ",") | ``List []string `flag:"list" default:"a,b" sep:";"` `` |
+| `layout`   | `time.Time` parse layout (default RFC3339) | ``Start time.Time `flag:"start" layout:"2006-01-02"` `` |
+| `sensitive`| Mask value in usage, errors, introspection | ``Password string `flag:"password" sensitive:"true"` `` |
+| `min`      | Minimum numeric value or min length (string/slice/map) | ``Retries int `flag:"retries" min:"1"` `` |
+| `max`      | Maximum numeric value or max length (string/slice/map) | ``Retries int `flag:"retries" max:"10"` `` |
+| `pattern`  | Regular expression a string must match | ``Name string `flag:"name" pattern:"^[a-z0-9_-]+$"` `` |
 
 Example:
 
@@ -110,6 +114,7 @@ Extended:
 * `json.RawMessage` (validated on default parse)
 * `*regexp.Regexp`
 * String enums via `enum:"a,b,c"`
+* Validated strings via `pattern:"^regex$"`
 
 Unsupported types trigger an error referencing the field.
 
@@ -176,6 +181,110 @@ type C struct {
 }
 ```
 Invalid values produce an error listing allowed values.
+
+## Validation Tags
+
+Validation is deferred until after all precedence layers are applied, so the final value (from CLI, env, secret, config or default) is checked.
+
+Supported tags:
+
+* `min` / `max` – apply to numeric types OR length (string, slice, map)
+* `pattern` – Go regexp applied to string value
+
+Multiple failures aggregate into a single error (joined with `; `) via an internal multi-error collector.
+
+```go
+type C struct {
+    Port int    `flag:"port" default:"8080" min:"1" max:"65535"`
+    Name string `flag:"name" pattern:"^[a-z0-9_-]{3,32}$"`
+}
+```
+
+## Sensitive Values
+
+Mark secrets so they are masked in:
+* Usage output (default values show as `******`)
+* Error messages (actual provided secret value suppressed)
+* Introspection metadata
+
+```go
+type Secrets struct {
+    Password string `flag:"password" required:"true" sensitive:"true"`
+}
+```
+
+You can also mark flags programmatically: `flag.MarkSensitive("password")`.
+
+## Introspection API
+
+Programmatically inspect all registered flags and their provenance:
+
+```go
+metas := flag.Introspect()
+for _, m := range metas {
+    fmt.Printf("%s: set=%v source=%s value=%q sensitive=%v\n", m.Name, m.Set, m.Source, m.Value, m.Sensitive)
+}
+```
+
+`Source` is one of: `cli`, `env`, `secret`, `config`, or `default`.
+Sensitive values are masked as `******` (value & default).
+
+## Disabling Auto Parse
+
+`ParseStruct` automatically calls `flag.Parse()` after registration. To decouple registration and parsing (e.g., to add more flags manually, or defer to a subcommand decision) use:
+
+```go
+var cfg Config
+if err := flag.ParseStructWithOptions(&cfg, flag.ParseStructOptions{AutoParse:false}); err != nil { log.Fatal(err) }
+// later
+flag.Parse()
+if err := flag.Validate(); err != nil { log.Fatal(err) }
+```
+
+`Validate()` executes deferred validations and returns aggregated errors (if any).
+
+## Nested Structs & Prefixing
+
+`ParseStruct` recurses into exported nested struct fields even when they lack a `flag` tag; their inner fields with `flag` tags are registered.
+
+You can apply a prefix to all flags in a nested struct using a `flagPrefix` tag on the nested struct field. Prefixes are concatenated with dots.
+
+```go
+type DBConfig struct {
+    Host string `flag:"host" default:"localhost"`
+    Port int    `flag:"port" default:"5432"`
+}
+type App struct {
+    DB DBConfig `flagPrefix:"db"`
+    Cache struct {
+        Size int `flag:"size" default:"128"`
+    } `flagPrefix:"cache"`
+}
+```
+
+Flags registered:
+```
+ -db.host   (default localhost)
+ -db.port   (default 5432)
+ -cache.size (default 128)
+```
+
+Nested prefixes compose; an inner struct with `flagPrefix:"inner"` under a parent with `flagPrefix:"outer"` yields flags like `-outer.inner.field`.
+
+## Provenance / Sources
+
+Each flag stores the source that supplied its final value. This is exposed via introspection; you can build diagnostics or config dumps that omit secrets but still show origin.
+
+Example (with a sensitive password read from env):
+
+```
+password: set=true source=env value="******" sensitive=true
+host: set=false source=default value="localhost" sensitive=false
+```
+
+## Error Aggregation
+
+When multiple validation errors occur they are combined into a single returned error (implementing `error`). Use type assertion to `interface{ Errors() []error }` if you need to inspect individual failures.
 
 ## Slices & Maps
 

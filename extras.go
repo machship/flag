@@ -69,9 +69,15 @@ func (f *FlagSet) ParseEnv(environ []string) error {
 				if expanded, err := expandAtFile(value); err == nil {
 					value = expanded
 				} else if !errors.Is(err, errNoAtExpansion) {
+					if f.isSensitive(name) {
+						return f.failf("invalid value for environment variable %s: %v", name, err)
+					}
 					return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
 				}
 				if err := fv.Set(value); err != nil {
+					if f.isSensitive(name) {
+						return f.failf("invalid boolean value for environment variable %s: %v", name, err)
+					}
 					return f.failf("invalid boolean value %q for environment variable %s: %v", value, name, err)
 				}
 			} else {
@@ -81,9 +87,15 @@ func (f *FlagSet) ParseEnv(environ []string) error {
 			if expanded, err := expandAtFile(value); err == nil {
 				value = expanded
 			} else if !errors.Is(err, errNoAtExpansion) {
+				if f.isSensitive(name) {
+					return f.failf("invalid value for environment variable %s: %v", name, err)
+				}
 				return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
 			}
 			if err := flag.Value.Set(value); err != nil {
+				if f.isSensitive(name) {
+					return f.failf("invalid value for environment variable %s: %v", name, err)
+				}
 				return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
 			}
 		}
@@ -93,6 +105,9 @@ func (f *FlagSet) ParseEnv(environ []string) error {
 			f.actual = make(map[string]*Flag)
 		}
 		f.actual[name] = flag
+		if f.sources != nil {
+			f.sources[name] = "env"
+		}
 
 	}
 	return nil
@@ -178,9 +193,15 @@ func (f *FlagSet) ParseFile(path string) error {
 				if expanded, err := expandAtFile(value); err == nil {
 					value = expanded
 				} else if !errors.Is(err, errNoAtExpansion) {
+					if f.isSensitive(name) {
+						return f.failf("invalid boolean value for configuration variable %s: %v", name, err)
+					}
 					return f.failf("invalid boolean value %q for configuration variable %s: %v", value, name, err)
 				}
 				if err := fv.Set(value); err != nil {
+					if f.isSensitive(name) {
+						return f.failf("invalid boolean value for configuration variable %s: %v", name, err)
+					}
 					return f.failf("invalid boolean value %q for configuration variable %s: %v", value, name, err)
 				}
 			} else {
@@ -190,9 +211,15 @@ func (f *FlagSet) ParseFile(path string) error {
 			if expanded, err := expandAtFile(value); err == nil {
 				value = expanded
 			} else if !errors.Is(err, errNoAtExpansion) {
+				if f.isSensitive(name) {
+					return f.failf("invalid value for configuration variable %s: %v", name, err)
+				}
 				return f.failf("invalid value %q for configuration variable %s: %v", value, name, err)
 			}
 			if err := flag.Value.Set(value); err != nil {
+				if f.isSensitive(name) {
+					return f.failf("invalid value for configuration variable %s: %v", name, err)
+				}
 				return f.failf("invalid value %q for configuration variable %s: %v", value, name, err)
 			}
 		}
@@ -202,6 +229,9 @@ func (f *FlagSet) ParseFile(path string) error {
 			f.actual = make(map[string]*Flag)
 		}
 		f.actual[name] = flag
+		if f.sources != nil {
+			f.sources[name] = "config"
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -284,6 +314,9 @@ func (f *FlagSet) ParseSecretDir(dir string) error {
 				val = expanded
 			} // nested @ optional
 			if err := target.Value.Set(val); err != nil {
+				if f.isSensitive(target.Name) {
+					return fmt.Errorf("secret file %s invalid for -%s: %v", name, target.Name, err)
+				}
 				return fmt.Errorf("secret file %s invalid for -%s: %w", name, target.Name, err)
 			}
 		}
@@ -291,6 +324,9 @@ func (f *FlagSet) ParseSecretDir(dir string) error {
 			f.actual = make(map[string]*Flag)
 		}
 		f.actual[target.Name] = target
+		if f.sources != nil {
+			f.sources[target.Name] = "secret"
+		}
 	}
 	return nil
 }

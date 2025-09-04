@@ -15,6 +15,27 @@ import (
 	decimal "github.com/shopspring/decimal"
 )
 
+// prefix stack for nested struct flagPrefix handling
+var prefixStack []string
+
+func pushPrefix(p string) {
+	if p == "" {
+		return
+	}
+	prefixStack = append(prefixStack, p)
+}
+func popPrefix() {
+	if len(prefixStack) > 0 {
+		prefixStack = prefixStack[:len(prefixStack)-1]
+	}
+}
+func currentPrefix() string {
+	if len(prefixStack) == 0 {
+		return ""
+	}
+	return strings.Join(prefixStack, ".")
+}
+
 /*
     In this file, we are going to define a way of users providing a struct that we can use to resolve flags.
 	The idea will be that the user can provide a struct with the following field tags:
@@ -28,12 +49,97 @@ import (
 	If the user has not provided any of the required fields when ParseStruct is called, we will return an error indicating which fields are missing.
 */
 
-func ParseStruct(s any) error {
+// internal validation helpers
+func checkMin(v reflect.Value, minTag, name string) error {
+	if minTag == "" {
+		return nil
+	}
+	min, err := strconv.ParseFloat(minTag, 64)
+	if err != nil {
+		return fmt.Errorf("invalid min tag for %s: %v", name, err)
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if float64(v.Int()) < min {
+			return fmt.Errorf("flag %s: value %d < min %s", name, v.Int(), minTag)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if float64(v.Uint()) < min {
+			return fmt.Errorf("flag %s: value %d < min %s", name, v.Uint(), minTag)
+		}
+	case reflect.Float32, reflect.Float64:
+		if v.Float() < min {
+			return fmt.Errorf("flag %s: value %v < min %s", name, v.Float(), minTag)
+		}
+	case reflect.String, reflect.Slice, reflect.Map:
+		if float64(v.Len()) < min {
+			return fmt.Errorf("flag %s: length %d < min %s", name, v.Len(), minTag)
+		}
+	}
+	return nil
+}
+func checkMax(v reflect.Value, maxTag, name string) error {
+	if maxTag == "" {
+		return nil
+	}
+	max, err := strconv.ParseFloat(maxTag, 64)
+	if err != nil {
+		return fmt.Errorf("invalid max tag for %s: %v", name, err)
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if float64(v.Int()) > max {
+			return fmt.Errorf("flag %s: value %d > max %s", name, v.Int(), maxTag)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if float64(v.Uint()) > max {
+			return fmt.Errorf("flag %s: value %d > max %s", name, v.Uint(), maxTag)
+		}
+	case reflect.Float32, reflect.Float64:
+		if v.Float() > max {
+			return fmt.Errorf("flag %s: value %v > max %s", name, v.Float(), maxTag)
+		}
+	case reflect.String, reflect.Slice, reflect.Map:
+		if float64(v.Len()) > max {
+			return fmt.Errorf("flag %s: length %d > max %s", name, v.Len(), maxTag)
+		}
+	}
+	return nil
+}
+func checkPattern(v reflect.Value, pat, name string) error {
+	if pat == "" {
+		return nil
+	}
+	if v.Kind() != reflect.String {
+		return nil
+	}
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return fmt.Errorf("invalid pattern tag for %s: %v", name, err)
+	}
+	if !re.MatchString(v.String()) {
+		return fmt.Errorf("flag %s: value %q does not match pattern %s", name, v.String(), pat)
+	}
+	return nil
+}
+
+// ParseStructOptions controls ParseStruct behavior.
+type ParseStructOptions struct{ AutoParse bool }
+
+// ParseStructWithOptions allows disabling automatic final Parse().
+func ParseStructWithOptions(s any, opts ParseStructOptions) error {
+	return parseStructInternal(s, opts)
+}
+
+// ParseStruct preserves legacy behavior (auto parse).
+func ParseStruct(s any) error { return parseStructInternal(s, ParseStructOptions{AutoParse: true}) }
+
+func parseStructInternal(s any, opts ParseStructOptions) error {
 	v := reflect.ValueOf(s)
 	if v.Kind() != reflect.Ptr || v.IsNil() {
 		return fmt.Errorf("ParseStruct expects a non-nil pointer to a struct, got %T", s)
 	}
-	if Parsed() {
+	if Parsed() && opts.AutoParse {
 		return fmt.Errorf("ParseStruct must be called before flag.Parse()")
 	}
 	v = v.Elem()
@@ -49,11 +155,21 @@ func ParseStruct(s any) error {
 			continue
 		} // unexported
 		flagName := field.Tag.Get("flag")
+		// Nested struct support: if no flag tag but it's a struct, recurse (without auto-parsing).
 		if flagName == "" {
+			if field.Type.Kind() == reflect.Struct {
+				fv := v.Field(i)
+				if fv.Kind() == reflect.Struct && fv.CanAddr() {
+					if err := parseStructInternal(fv.Addr().Interface(), ParseStructOptions{AutoParse: false}); err != nil {
+						return err
+					}
+				}
+			}
 			continue
 		}
 		help := field.Tag.Get("help")
 		required := strings.EqualFold(field.Tag.Get("required"), "true")
+		sensitiveTag := strings.EqualFold(field.Tag.Get("sensitive"), "true")
 		defTag := field.Tag.Get("default")
 		fv := v.Field(i)
 		// Explicit concrete types first
@@ -167,6 +283,28 @@ func ParseStruct(s any) error {
 				def = tmp
 			}
 			DurationSliceVar(fv.Addr().Interface().(*[]time.Duration), flagName, sep, def, help)
+		case reflect.TypeOf([]string(nil)):
+			sep := field.Tag.Get("sep")
+			if sep == "" {
+				sep = ","
+			}
+			flagName := field.Tag.Get("flag")
+			if flagName != "" {
+				if pf := currentPrefix(); pf != "" {
+					flagName = pf + "." + flagName
+				}
+			}
+			def := fv.Interface().([]string)
+			if required {
+				def = nil
+			} else if defTag != "" {
+				parts := strings.Split(defTag, sep)
+				for i := range parts {
+					parts[i] = strings.TrimSpace(parts[i])
+				}
+				def = parts
+			}
+			StringSliceVar(fv.Addr().Interface().(*[]string), flagName, sep, def, help)
 		case reflect.TypeOf(map[string]string(nil)):
 			def := fv.Interface().(map[string]string)
 			if required {
@@ -328,9 +466,47 @@ func ParseStruct(s any) error {
 		if required {
 			requiredFlags = append(requiredFlags, flagName)
 		}
+		if sensitiveTag {
+			CommandLine.MarkSensitive(flagName)
+		}
+		// validation tag capture
+		minTag := field.Tag.Get("min")
+		maxTag := field.Tag.Get("max")
+		patTag := field.Tag.Get("pattern")
+		if minTag != "" || maxTag != "" || patTag != "" {
+			fname := flagName
+			fvCopy := fv.Addr()
+			CommandLine.deferredValidations = append(CommandLine.deferredValidations, func() error {
+				var m MultiError
+				val := fvCopy.Elem()
+				if err := checkMin(val, minTag, fname); err != nil {
+					m.Append(err)
+				}
+				if err := checkMax(val, maxTag, fname); err != nil {
+					m.Append(err)
+				}
+				if err := checkPattern(val, patTag, fname); err != nil {
+					m.Append(err)
+				}
+				if m.HasErrors() {
+					return &m
+				}
+				return nil
+			})
+		}
 	}
-	if !Parsed() {
+	if opts.AutoParse && !Parsed() {
 		Parse()
+	}
+	// run deferred validations only if we auto-parsed (otherwise caller will Parse then call Validate manually).
+	if opts.AutoParse && len(CommandLine.deferredValidations) > 0 {
+		var all MultiError
+		for _, fn := range CommandLine.deferredValidations {
+			all.Append(fn())
+		}
+		if all.HasErrors() {
+			return &all
+		}
 	}
 	var missing []string
 	for _, name := range requiredFlags {

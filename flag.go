@@ -220,7 +220,7 @@ func (s *stringValue) Set(val string) error {
 
 func (s *stringValue) Get() interface{} { return string(*s) }
 
-func (s *stringValue) String() string { return fmt.Sprintf("%s", *s) }
+func (s *stringValue) String() string { return string(*s) }
 
 // -- float64 Value
 type float64Value float64
@@ -980,7 +980,7 @@ type Getter interface {
 // decompose the comma-separated string into the slice.
 func (f *FlagSet) Var(value Value, name string, usage string) {
 	// Remember the default value as a string; it won't change.
-	flag := &Flag{name, usage, value, value.String()}
+	flag := &Flag{Name: name, Usage: usage, Value: value, DefValue: value.String(), Sensitive: false}
 	_, alreadythere := f.formal[name]
 	if alreadythere {
 		var msg string
@@ -996,6 +996,12 @@ func (f *FlagSet) Var(value Value, name string, usage string) {
 		f.formal = make(map[string]*Flag)
 	}
 	f.formal[name] = flag
+	if f.sources != nil {
+		// register default provenance only once
+		if _, ok := f.sources[name]; !ok {
+			f.sources[name] = "default"
+		}
+	}
 }
 
 // Var defines a flag with the specified name and usage string. The type and
@@ -1095,6 +1101,9 @@ func (f *FlagSet) parseOne() (bool, error) {
 			return false, f.failf("flag needs an argument: -%s", name)
 		}
 		if err := flag.Value.Set(value); err != nil {
+			if f.isSensitive(name) {
+				return false, f.failf("invalid value for flag -%s: %v", name, err) // omit actual value
+			}
 			return false, f.failf("invalid value %q for flag -%s: %v", value, name, err)
 		}
 	}
@@ -1102,6 +1111,9 @@ func (f *FlagSet) parseOne() (bool, error) {
 		f.actual = make(map[string]*Flag)
 	}
 	f.actual[name] = flag
+	if f.sources != nil {
+		f.sources[name] = "cli"
+	}
 	return true, nil
 }
 
@@ -1187,6 +1199,33 @@ func (f *FlagSet) Parse(arguments []string) error {
 // Parsed reports whether f.Parse has been called.
 func (f *FlagSet) Parsed() bool { return f.parsed }
 
+// Validate executes deferred validations when ParseStruct was invoked with AutoParse=false.
+// It can be called multiple times; validations execute only once unless new ones were appended.
+func (f *FlagSet) Validate() error {
+	if !f.parsed {
+		return fmt.Errorf("Validate called before Parse")
+	}
+	if f.validationsDone {
+		return nil
+	}
+	if len(f.deferredValidations) == 0 {
+		f.validationsDone = true
+		return nil
+	}
+	var all MultiError
+	for _, fn := range f.deferredValidations {
+		all.Append(fn())
+	}
+	f.validationsDone = true
+	if all.HasErrors() {
+		return &all
+	}
+	return nil
+}
+
+// Validate runs deferred validations on the default CommandLine FlagSet.
+func Validate() error { return CommandLine.Validate() }
+
 // Parse parses the command-line flags from os.Args[1:].  Must be called
 // after all flags are defined and before flags are accessed by the program.
 func Parse() { CommandLine.Parse(os.Args[1:]) }
@@ -1202,7 +1241,7 @@ var CommandLine = NewFlagSet(os.Args[0], ExitOnError)
 // NewFlagSet returns a new, empty flag set with the specified name and
 // error handling property.
 func NewFlagSet(name string, errorHandling ErrorHandling) *FlagSet {
-	f := &FlagSet{name: name, errorHandling: errorHandling}
+	f := &FlagSet{name: name, errorHandling: errorHandling, sources: make(map[string]string), sensitive: make(map[string]struct{}), required: make(map[string]struct{})}
 	return f
 }
 
@@ -1241,14 +1280,89 @@ type FlagSet struct {
 	args          []string // arguments after flags
 	errorHandling ErrorHandling
 	output        io.Writer // nil means stderr; use out() accessor
+	// extended metadata
+	sources             map[string]string
+	sensitive           map[string]struct{}
+	deferredValidations []func() error
+	required            map[string]struct{}
+	validationsDone     bool
 }
+
+// MarkSensitive marks one or more flag names as sensitive causing their values
+// to be masked in usage output and error messages.
+func (f *FlagSet) MarkSensitive(names ...string) {
+	if f.sensitive == nil {
+		f.sensitive = make(map[string]struct{})
+	}
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		f.sensitive[n] = struct{}{}
+	}
+}
+
+func (f *FlagSet) isSensitive(name string) bool {
+	_, ok := f.sensitive[name]
+	return ok
+}
+
+// FlagMeta represents introspection metadata for a single flag.
+type FlagMeta struct {
+	Name      string `json:"name"`
+	Usage     string `json:"usage"`
+	Default   string `json:"default"`
+	Value     string `json:"value"`
+	Set       bool   `json:"set"`
+	Source    string `json:"source"`
+	Sensitive bool   `json:"sensitive"`
+}
+
+// Introspect returns metadata for all registered flags (sorted by name).
+func (f *FlagSet) Introspect() []FlagMeta {
+	out := make([]FlagMeta, 0, len(f.formal))
+	for _, fl := range sortFlags(f.formal) {
+		src := "default"
+		if f.sources != nil {
+			if s, ok := f.sources[fl.Name]; ok {
+				src = s
+			}
+		}
+		set := f.actual != nil && f.actual[fl.Name] != nil
+		valStr := fl.Value.String()
+		defStr := fl.DefValue
+		if fl.Sensitive || f.isSensitive(fl.Name) {
+			// Mask value but still indicate if set
+			if set {
+				valStr = "******"
+			} else {
+				valStr = ""
+			}
+			defStr = "******"
+		}
+		out = append(out, FlagMeta{
+			Name:      fl.Name,
+			Usage:     fl.Usage,
+			Default:   defStr,
+			Value:     valStr,
+			Set:       set,
+			Source:    src,
+			Sensitive: fl.Sensitive || f.isSensitive(fl.Name),
+		})
+	}
+	return out
+}
+
+// Introspect returns metadata for the default CommandLine FlagSet.
+func Introspect() []FlagMeta { return CommandLine.Introspect() }
 
 // A Flag represents the state of a flag.
 type Flag struct {
-	Name     string // name as it appears on command line
-	Usage    string // help message
-	Value    Value  // value as set
-	DefValue string // default value (as text); for usage message
+	Name      string // name as it appears on command line
+	Usage     string // help message
+	Value     Value  // value as set
+	DefValue  string // default value (as text); for usage message
+	Sensitive bool   // mask in usage / error output
 }
 
 // sortFlags returns the flags as a slice in lexicographical sorted order.
@@ -1429,11 +1543,14 @@ func (f *FlagSet) PrintDefaults() {
 		}
 		s += usage
 		if !isZeroValue(flag, flag.DefValue) {
+			defOut := flag.DefValue
+			if flag.Sensitive || f.isSensitive(flag.Name) {
+				defOut = "******"
+			}
 			if _, ok := flag.Value.(*stringValue); ok {
-				// put quotes on the value
-				s += fmt.Sprintf(" (default %q)", flag.DefValue)
+				s += fmt.Sprintf(" (default %q)", defOut)
 			} else {
-				s += fmt.Sprintf(" (default %v)", flag.DefValue)
+				s += fmt.Sprintf(" (default %v)", defOut)
 			}
 		}
 		fmt.Fprint(f.out(), s, "\n")
