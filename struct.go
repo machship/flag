@@ -146,18 +146,6 @@ func ParseStruct(s any) error {
 				def = bs
 			}
 			ByteSizeVar(fv.Addr().Interface().(*ByteSize), flagName, def, help)
-		case reflect.TypeOf([]string(nil)):
-			sep := field.Tag.Get("sep")
-			if sep == "" {
-				sep = ","
-			}
-			def := fv.Interface().([]string)
-			if required {
-				def = nil
-			} else if defTag != "" {
-				def = strings.Split(defTag, sep)
-			}
-			StringSliceVar(fv.Addr().Interface().(*[]string), flagName, sep, def, help)
 		case reflect.TypeOf([]time.Duration(nil)):
 			sep := field.Tag.Get("sep")
 			if sep == "" {

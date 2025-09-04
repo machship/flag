@@ -98,6 +98,10 @@ import (
 	decimal "github.com/shopspring/decimal"
 )
 
+// exitFunc is used instead of directly calling os.Exit to allow tests to exercise
+// ExitOnError branches without terminating the test process.
+var exitFunc = os.Exit
+
 // ErrHelp is the error returned if the -help or -h flag is invoked
 // but no such flag is defined.
 var ErrHelp = errors.New("flag: help requested")
@@ -280,7 +284,7 @@ func parseByteSize(s string) (ByteSize, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid size number %q: %v", numStr, err)
 	}
-	mult := float64(1)
+	var mult float64
 	switch unit {
 	case "", "B":
 		mult = 1
@@ -1120,7 +1124,7 @@ func (f *FlagSet) Parse(arguments []string) error {
 		case ContinueOnError:
 			return err
 		case ExitOnError:
-			os.Exit(2)
+			exitFunc(2)
 		case PanicOnError:
 			panic(err)
 		}
@@ -1130,7 +1134,7 @@ func (f *FlagSet) Parse(arguments []string) error {
 		case ContinueOnError:
 			return err
 		case ExitOnError:
-			os.Exit(2)
+			exitFunc(2)
 		case PanicOnError:
 			panic(err)
 		}
@@ -1170,7 +1174,7 @@ func (f *FlagSet) Parse(arguments []string) error {
 			case ContinueOnError:
 				return err
 			case ExitOnError:
-				os.Exit(2)
+				exitFunc(2)
 			case PanicOnError:
 				panic(err)
 			}
