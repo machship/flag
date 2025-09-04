@@ -20,20 +20,20 @@ If you follow the [twelve-factor app methodology][] this package supports the th
 
 ## Quick Start
 
-    flag.Deferred(func() error { // queued for execution after Parse / Validate
+```go
 package main
 
-    flag.Deferred(func() error { // queued for post-parse execution
-        "fmt"
-        "log"
-        flag "github.com/machship/flag"
+import (
+    "fmt"
+    "log"
+    flag "github.com/machship/flag"
 )
 
 func main() {
-        var age int
-        flag.IntVar(&age, "age", 0, "age of gopher")
-        flag.Parse()
-        fmt.Println("age:", age)
+    var age int
+    flag.IntVar(&age, "age", 0, "age of gopher")
+    flag.Parse()
+    fmt.Println("age:", age)
 }
 ```
 
@@ -105,11 +105,13 @@ Primitive & standard: bool, int, int64, uint, uint64, float64, string, time.Dura
 
 Extended:
 * `time.Time` (with `layout` tag)
+* `[]time.Time` (with `layout` tag & optional `sep`; see Time Slice Flags)
 * `decimal.Decimal` (github.com/shopspring/decimal)
 * `uuid.UUID`
 * `net.IP`, `net.IPNet` (CIDR)
 * `net/url`.URL
 * `ByteSize` (human sizes: 512B, 10KB, 1MiB, 2G, 5GiB ...)
+* `big.Int`, `big.Rat`
 * `[]string`, `[]time.Duration`
 * `map[string]string` (default string like `k=v,k2=v2`)
 * `json.RawMessage` (validated on default parse)
@@ -192,7 +194,7 @@ Supported tags:
 * `min` / `max` – apply to numeric types OR length (string, slice, map)
 * `pattern` – Go regexp applied to string value
 
-Multiple failures aggregate into a single error (joined with `; `) via an internal multi-error collector.
+Multiple failures aggregate into a single error (joined with `; `) via an internal multi-error collector (`MultiError`).
 
 ```go
 type C struct {
@@ -285,7 +287,22 @@ host: set=false source=default value="localhost" sensitive=false
 
 ## Error Aggregation
 
-When multiple validation errors occur they are combined into a single returned error (implementing `error`). Use type assertion to `interface{ Errors() []error }` if you need to inspect individual failures.
+When multiple validation errors occur they are combined into a single returned error (implementing `error`). The concrete type is `*flag.MultiError` which also implements:
+
+* `Errors() []error` – returns the individual errors
+* `Unwrap() []error` – Go's multi-error unwrapping, allowing `errors.Is` / `errors.As` to match any constituent error
+
+Example:
+
+```go
+if err := flag.ParseStruct(&cfg); err != nil {
+    var me *flag.MultiError
+    if errors.As(err, &me) {
+        for _, e := range me.Errors() { fmt.Println("validation:", e) }
+    }
+    return err
+}
+```
 
 ## Deprecation
 
@@ -319,6 +336,48 @@ type Schedule struct {
 
 CLI: `-windows 2025-09-05,2025-09-06`
 
+## Cross-field / Post-parse Validation (Deferred)
+
+Use `flag.Deferred(func() error { ... })` inside custom handlers or after manual registration to run logic after all precedence layers (CLI > env > secret > config > defaults) have settled. This is useful for:
+
+* Cross-field consistency checks (e.g. `start < end`)
+* Decoding multi-part derived values
+* Expensive validations you only want once
+
+Example:
+
+```go
+type Range struct {
+    Start time.Time `flag:"start" layout:"2006-01-02" required:"true"`
+    End   time.Time `flag:"end" layout:"2006-01-02" required:"true"`
+}
+var r Range
+if err := flag.ParseStruct(&r); err != nil { log.Fatal(err) }
+flag.Deferred(func() error { // or register before ParseStruct with AutoParse:false
+    if !r.End.After(r.Start) { return fmt.Errorf("end must be after start") }
+    return nil
+})
+if err := flag.Validate(); err != nil { log.Fatal(err) }
+```
+
+If you use `ParseStruct` with default `AutoParse:true`, deferred funcs added during struct handling execute automatically; any you add afterwards require calling `flag.Validate()`.
+
+## Programmatic API Summary
+
+Beyond the standard library-compatible surface, the following helpers are provided:
+
+* Sources / layering: `ParseStruct`, `ParseStructWithOptions`, `Validate`
+* Introspection: `Introspect()` -> `[]FlagMeta`
+* Sensitivity: `MarkSensitive(names...)`
+* Deprecation: `Deprecate(name, replacement)` (also via struct tag `deprecated`)
+* Hot reload: `StartWatcher(secretDir, configFile)`, `StopWatcher()`, `OnChange(flagName, func(string))`
+* Custom struct types: `RegisterStructHandler(reflect.Type, FieldHandler)` + `StructFieldContext`
+* Deferred post-parse hooks: `Deferred(func() error)`
+* Extended type registration helpers: `TimeVar`, `TimeSliceVar`, `ByteSizeVar`, `DecimalVar`, `IPVar`, `IPNetVar`, `URLVar`, `UUIDVar`, `BigIntVar`, `BigRatVar`, `RegexpVar`, `StringSliceVar`, `DurationSliceVar`, `TimeSliceVar`, `StringMapVar`, `JSONVar`, `EnumVar`
+* Environment prefix: `NewFlagSetWithEnvPrefix(name, prefix, handling)` (uses `APP_` style names)
+
+All of these augment (not replace) the original `flag` package patterns; you can mix and match incrementally.
+
 ## Struct Field Handler Registry
 
 Extend `ParseStruct` with custom types by registering a handler:
@@ -332,8 +391,8 @@ func init() {
         if ctx.DefaultTag != "" { def = ctx.DefaultTag }
         var raw string = def
         flag.StringVar(&raw, ctx.FlagName, raw, ctx.Help)
-        // deferred decode (append to internal validation list)
-        flag.CommandLine.Deferred(func() error { // or append directly to deferredValidations
+        // deferred decode after precedence layers settled
+        flag.Deferred(func() error {
             if raw == "" { return nil }
             b, err := base64.StdEncoding.DecodeString(raw)
             if err != nil { return fmt.Errorf("invalid base64 for -%s: %w", ctx.FlagName, err) }
@@ -353,6 +412,30 @@ Handler API:
 ## Generic Numeric Values
 
 All numeric flag types now share a generic implementation internally; public APIs (`IntVar`, `Uint64Var`, etc.) are unchanged. Avoid reflecting on internal unexported Value concrete types.
+
+## Hot Reload & OnChange Callbacks
+
+You can watch a secret directory and/or a config file for changes and react when specific flag values change.
+
+```go
+flag.StartWatcher("/run/secrets", "/app/config.conf")
+flag.OnChange("db-password", func(v string) {
+    // v is the new string value (be careful with sensitive data)
+    reloadDB(v)
+})
+defer flag.StopWatcher()
+```
+
+Behavior:
+* Secret dir watch: any file modification/add triggers re-read of that directory via `ParseSecretDir` (existing CLI/env values still win and are not overridden).
+* Config file watch: file change triggers re-parse of config file layer (only flags originally sourced from config layer or still unset are updated).
+* Only differences dispatch callbacks (per flag). Callbacks run in watcher goroutine; they are recovered on panic.
+* Sensitive flags are passed in plain form to callbacks; handle securely.
+
+Limitations / Notes:
+* Environment variable changes are not automatically detected (exported env cannot be watched portably).
+* Debouncing is not currently implemented—rapid successive writes may emit multiple callbacks.
+* CLI-provided values are never overwritten by hot reload.
 
 ## Slices & Maps
 
