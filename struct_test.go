@@ -28,10 +28,7 @@ func TestParseStruct_MissingRequired(t *testing.T) {
 	withArgs([]string{}, func() {
 		err := ParseStruct(&cfg)
 		if err == nil || !strings.Contains(err.Error(), "missing required flags: debug") {
-			// Expect debug required
-			// Provide full error for debugging
 			if err == nil {
-				// artificially populate err string to avoid nil deref
 				t.Fatal("expected error for missing required flag 'debug', got nil")
 			}
 			t.Fatalf("expected missing required debug flag, got: %v", err)
@@ -101,16 +98,34 @@ func TestParseStruct_InvalidDefault(t *testing.T) {
 	})
 }
 
+// Verify []string slice support via ParseStruct (regression for previous unsupported type test)
+func TestParseStruct_StringSliceSupported(t *testing.T) {
+	ResetForTesting(nil)
+	type C struct {
+		List []string `flag:"list" default:"a,b,c" sep:","`
+	}
+	var c C
+	withArgs([]string{"-list", "x,y"}, func() {
+		if err := ParseStruct(&c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if len(c.List) != 2 || c.List[0] != "x" || c.List[1] != "y" {
+		t.Fatalf("expected list [x y], got %#v", c.List)
+	}
+}
+
+// An actually unsupported type should error (e.g., complex64 not implemented)
 func TestParseStruct_UnsupportedType(t *testing.T) {
 	ResetForTesting(nil)
 	type C struct {
-		List []string `flag:"list"`
+		Num complex64 `flag:"num"`
 	}
 	var c C
 	withArgs([]string{}, func() {
 		err := ParseStruct(&c)
 		if err == nil || !strings.Contains(err.Error(), "unsupported field type") {
-			t.Fatalf("expected unsupported type error, got: %v", err)
+			t.Fatalf("expected unsupported field type error, got: %v", err)
 		}
 	})
 }
@@ -165,12 +180,9 @@ func TestParseStruct_DurationAndOthers(t *testing.T) {
 
 func TestParseStruct_CalledAfterParse(t *testing.T) {
 	ResetForTesting(nil)
-	// Trigger global parse first
 	withArgs([]string{"-test_dummy"}, func() {
-		// Define a dummy flag so parse doesn't error on unknown.
 		Bool("test_dummy", false, "")
 		Parse()
-		// Now attempt ParseStruct -> should error
 		type C struct {
 			Foo string `flag:"foo"`
 		}

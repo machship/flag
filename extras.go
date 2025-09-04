@@ -6,7 +6,10 @@ package flag
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -63,14 +66,23 @@ func (f *FlagSet) ParseEnv(environ []string) error {
 
 		if fv, ok := flag.Value.(boolFlag); ok && fv.IsBoolFlag() { // special case: doesn't need an arg
 			if hasValue {
+				if expanded, err := expandAtFile(value); err == nil {
+					value = expanded
+				} else if !errors.Is(err, errNoAtExpansion) {
+					return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
+				}
 				if err := fv.Set(value); err != nil {
 					return f.failf("invalid boolean value %q for environment variable %s: %v", value, name, err)
 				}
 			} else {
-				// flag without value is regarded a bool
 				fv.Set("true")
 			}
 		} else {
+			if expanded, err := expandAtFile(value); err == nil {
+				value = expanded
+			} else if !errors.Is(err, errNoAtExpansion) {
+				return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
+			}
 			if err := flag.Value.Set(value); err != nil {
 				return f.failf("invalid value %q for environment variable %s: %v", value, name, err)
 			}
@@ -98,6 +110,12 @@ func NewFlagSetWithEnvPrefix(name string, prefix string, errorHandling ErrorHand
 // path. Used to lookup and parse the config file when a default is set and
 // available on disk.
 var DefaultConfigFlagname = "config"
+
+// DefaultSecretDirFlagname defines an optional flag name whose value, if set,
+// points to a directory containing secret files (each filename = flag name or
+// underscore variant). If present, it is processed after environment variables
+// and before the config file.
+var DefaultSecretDirFlagname = "secret-dir"
 
 // ParseFile parses flags from the file in path.
 // Same format as commandline argumens, newlines and lines beginning with a
@@ -157,14 +175,23 @@ func (f *FlagSet) ParseFile(path string) error {
 
 		if fv, ok := flag.Value.(boolFlag); ok && fv.IsBoolFlag() { // special case: doesn't need an arg
 			if hasValue {
+				if expanded, err := expandAtFile(value); err == nil {
+					value = expanded
+				} else if !errors.Is(err, errNoAtExpansion) {
+					return f.failf("invalid boolean value %q for configuration variable %s: %v", value, name, err)
+				}
 				if err := fv.Set(value); err != nil {
 					return f.failf("invalid boolean value %q for configuration variable %s: %v", value, name, err)
 				}
 			} else {
-				// flag without value is regarded a bool
 				fv.Set("true")
 			}
 		} else {
+			if expanded, err := expandAtFile(value); err == nil {
+				value = expanded
+			} else if !errors.Is(err, errNoAtExpansion) {
+				return f.failf("invalid value %q for configuration variable %s: %v", value, name, err)
+			}
 			if err := flag.Value.Set(value); err != nil {
 				return f.failf("invalid value %q for configuration variable %s: %v", value, name, err)
 			}
@@ -181,5 +208,89 @@ func (f *FlagSet) ParseFile(path string) error {
 		return err
 	}
 
+	return nil
+}
+
+// --- Secret directory & @file support ---
+
+var errNoAtExpansion = errors.New("no @file expansion")
+
+// expandAtFile supports indirection syntax: a value beginning with '@path' will be
+// replaced by the file contents (trimmed of a single trailing newline). '@@' escapes
+// to a literal leading '@'. Returns errNoAtExpansion if no expansion occurred.
+func expandAtFile(val string) (string, error) {
+	if len(val) == 0 || val[0] != '@' {
+		return "", errNoAtExpansion
+	}
+	if strings.HasPrefix(val, "@@") {
+		return val[1:], nil
+	} // escaped
+	path := val[1:]
+	if path == "" {
+		return "", fmt.Errorf("invalid @file reference: empty path")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	// Trim a single trailing newline / CR
+	s := string(b)
+	s = strings.TrimRight(s, "\r\n")
+	return s, nil
+}
+
+// ParseSecretDir ingests secret values from a directory where each file's name
+// maps to a flag name (case-insensitive). Filename transformations tried in order:
+// 1. raw lower-case filename
+// 2. lower-case with '_' replaced by '-'
+// Existing (already set) flags are not overridden. Subdirectories are ignored.
+func (f *FlagSet) ParseSecretDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		lower := strings.ToLower(name)
+		candidates := []string{lower, strings.ReplaceAll(lower, "_", "-")}
+		var target *Flag
+		for _, cand := range candidates {
+			if fl := f.formal[cand]; fl != nil {
+				target = fl
+				break
+			}
+		}
+		if target == nil {
+			continue
+		}
+		if f.actual != nil && f.actual[target.Name] != nil {
+			continue
+		} // respect precedence
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		val := strings.TrimRight(string(data), "\r\n")
+		if fv, ok := target.Value.(boolFlag); ok && fv.IsBoolFlag() && (val == "" || strings.EqualFold(val, "true")) {
+			// Empty or 'true' sets boolean true
+			if err := fv.Set("true"); err != nil {
+				return err
+			}
+		} else {
+			if expanded, err := expandAtFile(val); err == nil {
+				val = expanded
+			} // nested @ optional
+			if err := target.Value.Set(val); err != nil {
+				return fmt.Errorf("secret file %s invalid for -%s: %w", name, target.Name, err)
+			}
+		}
+		if f.actual == nil {
+			f.actual = make(map[string]*Flag)
+		}
+		f.actual[target.Name] = target
+	}
 	return nil
 }

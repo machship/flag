@@ -1,172 +1,251 @@
 Flag
-===
+====
 
-Flag is a drop in replacement for Go's flag package with the addition to parse files and environment variables. If you support the [twelve-factor app methodology][], Flag complies with the third factor; "Store config in the environment".
+An extended, drop‑in replacement for Go's standard `flag` package originally forked from [namsral/flag] and enhanced with:
+
+* Multi-source configuration with layered precedence
+* Automatic struct-based flag registration (`ParseStruct`)
+* Secret directory ingestion (`-secret-dir`) and `@file` indirection for values
+* Extended types (time, decimal, UUID, IP/CIDR, URL, ByteSize, slices, maps, regex, JSON raw, enums, duration slices, etc.)
+* Environment variable prefix support
+* Enum validation via struct tags
+* Zero external runtime dependencies beyond a few well-known libraries (uuid, decimal)
+
+If you follow the [twelve-factor app methodology][] this package supports the third factor: store config in the environment—while also adding secure secret file loading and ergonomics for complex configuration surfaces.
 
 [twelve-factor app methodology]: http://12factor.net
+[namsral/flag]: https://github.com/namsral/flag
 
-An example using a gopher:
+---
+
+## Quick Start
 
 ```go
-$ cat > gopher.go
-    package main
+package main
 
-    import (
+import (
         "fmt"
-    	"github.com/machship/flag"
-	)
-    
-    func main() {
-    	var age int
-	flag.IntVar(&age, "age", 0, "age of gopher")
-	flag.Parse()
-	fmt.Print("age:", age)
-    }
-$ go run gopher.go -age 1
-age: 1
+        "log"
+        flag "github.com/machship/flag"
+)
+
+func main() {
+        var age int
+        flag.IntVar(&age, "age", 0, "age of gopher")
+        flag.Parse()
+        fmt.Println("age:", age)
+}
 ```
 
-Same code but using an environment variable:
-
-```go
-$ export AGE=2
-$ go run gopher.go
-age: 2
-```
-    
-
-Same code but using a configuration file:
-
-```go
-$ cat > gopher.conf
-age 3
-
-$ go run gopher.go -config gopher.conf
-age: 3
+```bash
+go run main.go -age 1   # CLI
+export AGE=2; go run main.go   # ENV
+echo 'age 3' > cfg.conf; go run main.go -config cfg.conf   # File
 ```
 
-The following table shows how flags are translated to environment variables and configuration files:
+## Precedence (highest wins)
+1. Command line flags
+2. Environment variables
+3. Secret directory files (`-secret-dir` if set)
+4. Configuration file (`-config` if set)
+5. Declared / struct defaults (or zero values)
 
-| Type   | Flag          | Environment  | File         |
-| ------ | :------------ |:------------ |:------------ |
-| int    | -age 2        | AGE=2        | age 2        |
-| bool   | -female       | FEMALE=true  | female true  |
-| float  | -length 175.5 | LENGTH=175.5 | length 175.5 |
-| string | -name Gloria  | NAME=Gloria  | name Gloria  |
+## ParseStruct: Declarative Flag Registration
 
-This package is a port of Go's [flag][] package from the standard library with the addition of two functions `ParseEnv` and `ParseFile`.
+`ParseStruct(ptr)` reflects over a struct and auto-registers flags based on field tags. After registration it calls the global `Parse()`, applying the same layered precedence, then validates required flags.
 
-[flag]: http://golang.org/src/pkg/flag
+Supported struct tags:
 
-
-Goals
------
-
-- Compatability with the original `flag` package
-- Support the [twelve-factor app methodology][]
-- Uniform user experience between the three input methods
-
-
-Why?
----
-
-Why not use one of the many INI, JSON or YAML parsers?
-
-I find it best practice to have simple configuration options to control the behaviour of an applications when it starts up. Use basic types like ints, floats and strings for configuration options and store more complex data structures in the "datastore" layer.
-
-
-Usage
----
-
-It's intended for projects which require a simple configuration made available through command-line flags, configuration files and shell environments. It's similar to the original `flag` package.
+| Tag       | Purpose | Example |
+|-----------|---------|---------|
+| `flag`    | Flag name (required to participate) | ``Host string `flag:"host"` `` |
+| `default` | Default value (ignored if `required:"true"`) | ``Port int `flag:"port" default:"8080"` `` |
+| `help`    | Usage/help text | ``Debug bool `flag:"debug" help:"enable debug"` `` |
+| `required`| Mark as required (`true`/`false`) | ``APIKey string `flag:"api-key" required:"true"` `` |
+| `enum`    | Comma list of allowed values (string only) | ``Mode string `flag:"mode" enum:"dev,staging,prod"` `` |
+| `sep`     | Separator for slice flags (default ",") | ``List []string `flag:"list" default:"a,b" sep:";"` `` |
+| `layout`  | `time.Time` parse layout (default RFC3339) | ``Start time.Time `flag:"start" layout:"2006-01-02"` `` |
 
 Example:
 
 ```go
-import "github.com/machship/flag"
+type Config struct {
+        SecretDir string            `flag:"secret-dir" default:"/run/secrets" help:"directory of secret files"`
+        Config    string            `flag:"config" help:"optional config file"`
+        Host      string            `flag:"host" default:"localhost"`
+        Port      int               `flag:"port" default:"8080"`
+        Debug     bool              `flag:"debug" required:"true"`
+        Mode      string            `flag:"mode" enum:"dev,staging,prod" default:"dev"`
+        Timeout   time.Duration     `flag:"timeout" default:"5s"`
+        Start     time.Time         `flag:"start" layout:"2006-01-02" default:"2025-09-04"`
+        Tags      []string          `flag:"tags" default:"alpha,beta" sep:","`
+        Delays    []time.Duration   `flag:"delays" default:"100ms,250ms"`
+        Meta      map[string]string `flag:"meta" default:"region=us,team=core"`
+        Pattern   *regexp.Regexp    `flag:"pattern" default:"^user_[0-9]+$"`
+        JSONBlob  json.RawMessage   `flag:"json" default:"{\"enabled\":true}"`
+        ID        uuid.UUID         `flag:"id" default:"00000000-0000-0000-0000-000000000000"`
+        Price     decimal.Decimal   `flag:"price" default:"12.99"`
+        CIDR      net.IPNet         `flag:"cidr" default:"10.0.0.0/24"`
+        URL       neturl.URL        `flag:"endpoint" default:"https://api.example.com"`
+        Limit     ByteSize          `flag:"limit" default:"10MB" help:"memory limit"`
+}
 
-flag.String(flag.DefaultConfigFlagname, "", "path to config file")
-flag.Int("age", 24, "help message for age")
-
-flag.Parse()
+var cfg Config
+if err := flag.ParseStruct(&cfg); err != nil { log.Fatal(err) }
 ```
 
-Order of precedence:
+### Supported Types
 
-1. Command line options
-2. Environment variables
-3. Configuration file
-4. Default values
+Primitive & standard: bool, int, int64, uint, uint64, float64, string, time.Duration
 
+Extended:
+* `time.Time` (with `layout` tag)
+* `decimal.Decimal` (github.com/shopspring/decimal)
+* `uuid.UUID`
+* `net.IP`, `net.IPNet` (CIDR)
+* `net/url`.URL
+* `ByteSize` (human sizes: 512B, 10KB, 1MiB, 2G, 5GiB ...)
+* `[]string`, `[]time.Duration`
+* `map[string]string` (default string like `k=v,k2=v2`)
+* `json.RawMessage` (validated on default parse)
+* `*regexp.Regexp`
+* String enums via `enum:"a,b,c"`
 
-#### Parsing Configuration Files
+Unsupported types trigger an error referencing the field.
 
-Create a configuration file:
+## Secret Directory Support (`-secret-dir`)
+
+If a flag named `secret-dir` (or the value of `flag.DefaultSecretDirFlagname`) is set (CLI, env, or default), every regular file in that directory is considered a potential flag value.
+
+Filename → flag name resolution tries:
+1. Lower-case filename
+2. Lower-case with underscores converted to dashes
+
+Rules:
+* Existing values (set by CLI or env) are NOT overridden
+* Empty file for a bool flag sets it to `true`
+* Contents are trimmed of one trailing newline
+* A value starting with `@path` is replaced by the referenced file's contents (use `@@` to escape a literal `@`)
+
+Example layout:
+```
+/run/secrets/
+    db-user        => "alice"\n
+    db-pass        => "@/run/secure/pass.txt"   (indirection)
+    DEBUG          => ""  (sets -debug)
+```
 
 ```go
-$ cat > ./gopher.conf
-# empty newlines and lines beginning with a "#" character are ignored.
-name bob
-
-# keys and values can also be separated by the "=" character
-age=20
-
-# booleans can be empty, set with 0, 1, true, false, etc
-hacker
+type C struct {
+    SecretDir string `flag:"secret-dir" default:"/run/secrets"`
+    DBUser    string `flag:"db-user" required:"true"`
+    DBPass    string `flag:"db-pass" required:"true"`
+    Debug     bool   `flag:"debug"`
+}
+var c C
+if err := flag.ParseStruct(&c); err != nil { log.Fatal(err) }
 ```
 
-Add a "config" flag:
+## `@file` Indirection
+
+Anywhere a value is accepted (CLI, env, config file, secret file) you can supply `@/path/to/file` to load the value from that file. Use `@@` to escape.
+
+| Input | Example | Result |
+|-------|---------|--------|
+| CLI | `-password @/run/secret/pass` | flag value becomes file contents |
+| Env | `PASSWORD=@/run/secret/pass` | same |
+| Config file | `password @/run/secret/pass` | same |
+| Secret file | file contains `@/path` | nested expansion |
+
+## ByteSize Type
+
+Human-friendly sizes with decimal (KB=1000) or binary (KiB=1024) units.
+
+Examples: `512B`, `128K`, `10KB`, `12MiB`, `1G`, `2GiB`, `5TB`, `3TiB`.
 
 ```go
-flag.String(flag.DefaultConfigFlagname, "", "path to config file")
+var limit flag.ByteSize
+flag.ByteSizeVar(&limit, "limit", 0, "memory limit")
 ```
 
-Run the command:
+## Enum Flags
 
 ```go
-$ go run ./gopher.go -config ./gopher.conf
+type C struct {
+    Mode string `flag:"mode" enum:"dev,staging,prod" default:"dev"`
+}
+```
+Invalid values produce an error listing allowed values.
+
+## Slices & Maps
+
+| Type | Declaration | Default Tag Example |
+|------|-------------|---------------------|
+| `[]string` | ``Tags []string `flag:"tags" sep:","` `` | `default:"a,b,c"` |
+| `[]time.Duration` | ``Delays []time.Duration `flag:"delays"` `` | `default:"100ms,1s"` |
+| `map[string]string` | ``Meta map[string]string `flag:"meta"` `` | `default:"k=v,team=core"` |
+
+`sep` controls splitting for slices (default ","). Map defaults expect `k=v` comma separated pairs.
+
+## Configuration File Format
+
+Plain text, one flag per line:
+
+```
+key value
+key=value
+booleanFlag
+# comments and blank lines ignored
 ```
 
-The default flag name for the configuration file is "config" and can be changed
-by setting `flag.DefaultConfigFlagname`:
+## Environment Variables
+
+Name is the flag name upper-cased, dashes replaced by underscores. Optional prefix via `NewFlagSetWithEnvPrefix`.
 
 ```go
-flag.DefaultConfigFlagname = "conf"
-flag.Parse()
+fs := flag.NewFlagSetWithEnvPrefix(os.Args[0], "APP", flag.ContinueOnError)
+fs.String("db-host", "localhost", "db host")
+// Parses APP_DB_HOST
 ```
 
-#### Parsing Environment Variables
-
-Environment variables are parsed 1-on-1 with defined flags:
+## Extended Example End-to-End
 
 ```go
-$ export AGE=44
-$ go run ./gopher.go
-age=44
+type Config struct {
+    SecretDir string        `flag:"secret-dir" default:"./secrets"`
+    Config    string        `flag:"config"`
+    Host      string        `flag:"host" default:"localhost"`
+    Port      int           `flag:"port" default:"8080"`
+    Mode      string        `flag:"mode" enum:"dev,staging,prod" default:"dev"`
+    Timeout   time.Duration `flag:"timeout" default:"5s"`
+    Limits    []time.Duration `flag:"limits" default:"100ms,200ms,500ms"`
+    SizeLimit flag.ByteSize `flag:"limit" default:"256MiB"`
+}
+
+var cfg Config
+if err := flag.ParseStruct(&cfg); err != nil { log.Fatal(err) }
 ```
 
+Populate via (in ascending precedence):
+* Default tag values
+* `config` file (if provided)
+* Secret dir files (if `secret-dir` set)
+* Environment variables (e.g. `PORT=9000`)
+* CLI flags (`-port 9000`)
 
-You can also parse prefixed environment variables by setting a prefix name when creating a new empty flag set:
+## Migration From namsral/flag
 
-```go
-fs := flag.NewFlagSetWithEnvPrefix(os.Args[0], "GO", 0)
-fs.Int("age", 24, "help message for age")
-fs.Parse(os.Args[1:])
-...
-$ go export GO_AGE=33
-$ go run ./gopher.go
-age=33
-```
+Most code will continue to compile unchanged. New features are opt‑in:
+* Add `ParseStruct` instead of manually declaring many flags
+* Add a `secret-dir` flag for secret ingestion
+* Use `@file` syntax to externalize sensitive values
+* Leverage additional types and enums without extra boilerplate
 
+## Examples
 
-For more examples see the [examples][] directory in the project repository.
+See the [examples](./examples) directory for simple usage patterns. Tests in the repository exercise advanced features (secret dir, struct parsing, indirection).
 
-[examples]: https://github.com/machship/flag/tree/master/examples
-
-That's it.
-
-
-License
+## License
 ---
 
 

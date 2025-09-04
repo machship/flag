@@ -1136,6 +1136,27 @@ func (f *FlagSet) Parse(arguments []string) error {
 		}
 		return err
 	}
+	// Secret directory processing (after env, before config)
+	var sDir string
+	if sf := f.formal[DefaultSecretDirFlagname]; sf != nil { // default value
+		sDir = sf.Value.String()
+	}
+	if sf := f.actual[DefaultSecretDirFlagname]; sf != nil { // CLI or env override
+		sDir = sf.Value.String()
+	}
+	if sDir != "" {
+		if err := f.ParseSecretDir(sDir); err != nil {
+			switch f.errorHandling {
+			case ContinueOnError:
+				return err
+			case ExitOnError:
+				os.Exit(2)
+			case PanicOnError:
+				panic(err)
+			}
+			return err
+		}
+	}
 	var cFile string
 	if cf := f.formal[DefaultConfigFlagname]; cf != nil {
 		cFile = cf.Value.String()
