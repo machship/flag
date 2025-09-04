@@ -6,7 +6,7 @@ An extended, drop‑in replacement for Go's standard `flag` package originally f
 * Multi-source configuration with layered precedence
 * Automatic struct-based flag registration (`ParseStruct`)
 * Secret directory ingestion (`-secret-dir`) and `@file` indirection for values
-* Extended types (time, decimal, UUID, IP/CIDR, URL, ByteSize, slices, maps, regex, JSON raw, enums, duration slices, etc.)
+* Extended types (time, decimal, UUID, IP/CIDR, URL, ByteSize, slices, maps, regex, JSON raw, enums, duration & time slices, etc.)
 * Environment variable prefix support
 * Enum validation via struct tags
 * Zero external runtime dependencies beyond a few well-known libraries (uuid, decimal)
@@ -20,10 +20,10 @@ If you follow the [twelve-factor app methodology][] this package supports the th
 
 ## Quick Start
 
-```go
+    flag.Deferred(func() error { // queued for execution after Parse / Validate
 package main
 
-import (
+    flag.Deferred(func() error { // queued for post-parse execution
         "fmt"
         "log"
         flag "github.com/machship/flag"
@@ -69,6 +69,7 @@ Supported struct tags:
 | `min`      | Minimum numeric value or min length (string/slice/map) | ``Retries int `flag:"retries" min:"1"` `` |
 | `max`      | Maximum numeric value or max length (string/slice/map) | ``Retries int `flag:"retries" max:"10"` `` |
 | `pattern`  | Regular expression a string must match | ``Name string `flag:"name" pattern:"^[a-z0-9_-]+$"` `` |
+| `deprecated` | Mark deprecated; value is replacement name or message | ``Old string `flag:"old" deprecated:"new"` `` |
 
 Example:
 
@@ -286,12 +287,80 @@ host: set=false source=default value="localhost" sensitive=false
 
 When multiple validation errors occur they are combined into a single returned error (implementing `error`). Use type assertion to `interface{ Errors() []error }` if you need to inspect individual failures.
 
+## Deprecation
+
+Mark flags as deprecated with a struct tag or programmatically:
+
+```go
+type Opts struct {
+    Old string `flag:"old" deprecated:"new"` // suggests replacement
+    Legacy int  `flag:"legacy" deprecated:"(will be removed)"`
+}
+```
+
+First use prints a one-time warning:
+
+```
+warning: flag -old is deprecated, use -new instead
+warning: flag -legacy is deprecated (will be removed)
+```
+
+Programmatic: `flag.Deprecate("old", "new")`.
+
+## Time Slice Flags
+
+`[]time.Time` flags parse comma (or custom sep) separated values. Layout defaults to RFC3339 unless `layout` tag provided.
+
+```go
+type Schedule struct {
+    Windows []time.Time `flag:"windows" layout:"2006-01-02" default:"2025-09-05,2025-09-06"`
+}
+```
+
+CLI: `-windows 2025-09-05,2025-09-06`
+
+## Struct Field Handler Registry
+
+Extend `ParseStruct` with custom types by registering a handler:
+
+```go
+type Base64String string
+
+func init() {
+    flag.RegisterStructHandler(reflect.TypeOf(Base64String("")), func(ctx *flag.StructFieldContext) (bool, error) {
+        def := ctx.Value.String()
+        if ctx.DefaultTag != "" { def = ctx.DefaultTag }
+        var raw string = def
+        flag.StringVar(&raw, ctx.FlagName, raw, ctx.Help)
+        // deferred decode (append to internal validation list)
+        flag.CommandLine.Deferred(func() error { // or append directly to deferredValidations
+            if raw == "" { return nil }
+            b, err := base64.StdEncoding.DecodeString(raw)
+            if err != nil { return fmt.Errorf("invalid base64 for -%s: %w", ctx.FlagName, err) }
+            *(*Base64String)(ctx.Value.Addr().Interface().(*Base64String)) = Base64String(b)
+            return nil
+        })
+        return true, nil
+    })
+}
+```
+
+Handler API:
+* `RegisterStructHandler(reflect.Type, FieldHandler)`
+* `FieldHandler` returns `(handled bool, err error)`
+* `StructFieldContext` carries tags (`DefaultTag`, `Deprecated`, etc.)
+
+## Generic Numeric Values
+
+All numeric flag types now share a generic implementation internally; public APIs (`IntVar`, `Uint64Var`, etc.) are unchanged. Avoid reflecting on internal unexported Value concrete types.
+
 ## Slices & Maps
 
 | Type | Declaration | Default Tag Example |
 |------|-------------|---------------------|
 | `[]string` | ``Tags []string `flag:"tags" sep:","` `` | `default:"a,b,c"` |
 | `[]time.Duration` | ``Delays []time.Duration `flag:"delays"` `` | `default:"100ms,1s"` |
+| `[]time.Time` | ``Times []time.Time `flag:"times" layout:"2006-01-02T15:04:05Z07:00"` `` | `default:"2025-09-05T10:00:00Z,2025-09-05T12:00:00Z"` |
 | `map[string]string` | ``Meta map[string]string `flag:"meta"` `` | `default:"k=v,team=core"` |
 
 `sep` controls splitting for slices (default ","). Map defaults expect `k=v` comma separated pairs.

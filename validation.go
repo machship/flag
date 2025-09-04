@@ -31,3 +31,13 @@ func (m *MultiError) Append(err error) {
 
 // HasErrors returns true if at least one error recorded.
 func (m *MultiError) HasErrors() bool { return m != nil && len(m.errs) > 0 }
+
+// Unwrap returns the underlying errors slice to support errors.Is / errors.As
+// style matching introduced in Go 1.20+ which walks multiple errors when
+// Unwrap() []error is provided.
+func (m *MultiError) Unwrap() []error {
+	if m == nil {
+		return nil
+	}
+	return m.errs
+}

@@ -170,9 +170,41 @@ func parseStructInternal(s any, opts ParseStructOptions) error {
 		help := field.Tag.Get("help")
 		required := strings.EqualFold(field.Tag.Get("required"), "true")
 		sensitiveTag := strings.EqualFold(field.Tag.Get("sensitive"), "true")
+		deprecatedTag := field.Tag.Get("deprecated") // if set, note deprecation after registration
 		defTag := field.Tag.Get("default")
 		fv := v.Field(i)
-		// Explicit concrete types first
+		// Build context for registry
+		ctx := &StructFieldContext{
+			FS:         CommandLine,
+			Field:      field,
+			Value:      fv,
+			FlagName:   flagName,
+			Help:       help,
+			Required:   required,
+			Sensitive:  sensitiveTag,
+			Deprecated: deprecatedTag,
+			DefaultTag: defTag,
+			Tags: map[string]string{
+				"layout": field.Tag.Get("layout"),
+				"sep":    field.Tag.Get("sep"),
+				"enum":   field.Tag.Get("enum"),
+			},
+		}
+		if handled, hErr := tryHandleStructField(ctx); hErr != nil {
+			return regErr(field.Name, hErr)
+		} else if handled {
+			if required {
+				requiredFlags = append(requiredFlags, flagName)
+			}
+			if deprecatedTag != "" {
+				Deprecate(flagName, deprecatedTag)
+			}
+			if sensitiveTag {
+				CommandLine.MarkSensitive(flagName)
+			}
+			goto VALIDATION_TAGS
+		}
+		// Fallback legacy explicit concrete types first
 		switch field.Type {
 		case reflect.TypeOf(time.Time{}):
 			layout := field.Tag.Get("layout")
@@ -466,9 +498,13 @@ func parseStructInternal(s any, opts ParseStructOptions) error {
 		if required {
 			requiredFlags = append(requiredFlags, flagName)
 		}
+		if deprecatedTag != "" {
+			Deprecate(flagName, deprecatedTag)
+		}
 		if sensitiveTag {
 			CommandLine.MarkSensitive(flagName)
 		}
+	VALIDATION_TAGS:
 		// validation tag capture
 		minTag := field.Tag.Get("min")
 		maxTag := field.Tag.Get("max")

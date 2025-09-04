@@ -94,9 +94,64 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/google/uuid"
 	decimal "github.com/shopspring/decimal"
 )
+
+// Generic numeric value consolidation (int, int64, uint, uint64, float64)
+// Retains existing exported API (IntVar, UintVar, etc.) while eliminating
+// duplicate per-type Value implementations moving forward. Legacy structs
+// remain below temporarily for backward compatibility with any code that
+// may have relied on reflection of those concrete types.
+type numberValue[T ~int | ~int64 | ~uint | ~uint64 | ~float64] struct{ p *T }
+
+func newNumberValue[T ~int | ~int64 | ~uint | ~uint64 | ~float64](val T, p *T) *numberValue[T] {
+	*p = val
+	return &numberValue[T]{p: p}
+}
+func (nv *numberValue[T]) Set(s string) error {
+	var zero T
+	switch any(zero).(type) {
+	case int, int64:
+		v, err := strconv.ParseInt(s, 0, 64)
+		if err != nil {
+			return err
+		}
+		*nv.p = T(v)
+	case uint, uint64:
+		v, err := strconv.ParseUint(s, 0, 64)
+		if err != nil {
+			return err
+		}
+		*nv.p = T(v)
+	case float64:
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+		*nv.p = T(v)
+	default:
+		return fmt.Errorf("unsupported numeric type")
+	}
+	return nil
+}
+func (nv *numberValue[T]) Get() interface{} {
+	if nv == nil || nv.p == nil {
+		var z T
+		return z
+	}
+	return *nv.p
+}
+func (nv *numberValue[T]) String() string {
+	if nv == nil || nv.p == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%v", *nv.p)
+}
 
 // exitFunc is used instead of directly calling os.Exit to allow tests to exercise
 // ExitOnError branches without terminating the test process.
@@ -134,12 +189,7 @@ type boolFlag interface {
 }
 
 // -- int Value
-type intValue int
-
-func newIntValue(val int, p *int) *intValue {
-	*p = val
-	return (*intValue)(p)
-}
+type intValue int // retained for backward compatibility (deprecated)
 
 func (i *intValue) Set(s string) error {
 	v, err := strconv.ParseInt(s, 0, 64)
@@ -152,12 +202,7 @@ func (i *intValue) Get() interface{} { return int(*i) }
 func (i *intValue) String() string { return fmt.Sprintf("%v", *i) }
 
 // -- int64 Value
-type int64Value int64
-
-func newInt64Value(val int64, p *int64) *int64Value {
-	*p = val
-	return (*int64Value)(p)
-}
+type int64Value int64 // deprecated legacy type
 
 func (i *int64Value) Set(s string) error {
 	v, err := strconv.ParseInt(s, 0, 64)
@@ -170,12 +215,7 @@ func (i *int64Value) Get() interface{} { return int64(*i) }
 func (i *int64Value) String() string { return fmt.Sprintf("%v", *i) }
 
 // -- uint Value
-type uintValue uint
-
-func newUintValue(val uint, p *uint) *uintValue {
-	*p = val
-	return (*uintValue)(p)
-}
+type uintValue uint // deprecated legacy type
 
 func (i *uintValue) Set(s string) error {
 	v, err := strconv.ParseUint(s, 0, 64)
@@ -188,12 +228,7 @@ func (i *uintValue) Get() interface{} { return uint(*i) }
 func (i *uintValue) String() string { return fmt.Sprintf("%v", *i) }
 
 // -- uint64 Value
-type uint64Value uint64
-
-func newUint64Value(val uint64, p *uint64) *uint64Value {
-	*p = val
-	return (*uint64Value)(p)
-}
+type uint64Value uint64 // deprecated legacy type
 
 func (i *uint64Value) Set(s string) error {
 	v, err := strconv.ParseUint(s, 0, 64)
@@ -223,12 +258,7 @@ func (s *stringValue) Get() interface{} { return string(*s) }
 func (s *stringValue) String() string { return string(*s) }
 
 // -- float64 Value
-type float64Value float64
-
-func newFloat64Value(val float64, p *float64) *float64Value {
-	*p = val
-	return (*float64Value)(p)
-}
+type float64Value float64 // deprecated legacy type
 
 func (f *float64Value) Set(s string) error {
 	v, err := strconv.ParseFloat(s, 64)
@@ -603,6 +633,52 @@ func (dv *durationSliceValue) String() string {
 }
 func (dv *durationSliceValue) Get() interface{} { return *dv.p }
 
+// time.Time slice (comma or custom separated, RFC3339 or provided layout)
+type timeSliceValue struct {
+	p      *[]time.Time
+	sep    string
+	layout string
+}
+
+func newTimeSliceValue(val []time.Time, sep, layout string, p *[]time.Time) *timeSliceValue {
+	if sep == "" {
+		sep = ","
+	}
+	if layout == "" {
+		layout = time.RFC3339
+	}
+	*p = append((*p)[:0], val...)
+	return &timeSliceValue{p: p, sep: sep, layout: layout}
+}
+func (tv *timeSliceValue) Set(s string) error {
+	parts := strings.Split(s, tv.sep)
+	out := make([]time.Time, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		t, err := time.Parse(tv.layout, part)
+		if err != nil {
+			return err
+		}
+		out = append(out, t)
+	}
+	*tv.p = out
+	return nil
+}
+func (tv *timeSliceValue) String() string {
+	if tv.p == nil {
+		return ""
+	}
+	var ss []string
+	for _, t := range *tv.p {
+		ss = append(ss, t.Format(tv.layout))
+	}
+	return strings.Join(ss, tv.sep)
+}
+func (tv *timeSliceValue) Get() interface{} { return *tv.p }
+
 // map[string]string (comma separated key=value list)
 type stringMapValue struct{ p *map[string]string }
 
@@ -896,6 +972,25 @@ func DurationSlice(name, sep string, value []time.Duration, usage string) *[]tim
 	return CommandLine.DurationSlice(name, sep, value, usage)
 }
 
+// TimeSliceVar registers a []time.Time flag using provided layout (default RFC3339) and separator.
+func (f *FlagSet) TimeSliceVar(p *[]time.Time, name, sep, layout string, value []time.Time, usage string) {
+	if layout == "" {
+		layout = time.RFC3339
+	}
+	f.Var(newTimeSliceValue(value, sep, layout, p), name, usage)
+}
+func TimeSliceVar(p *[]time.Time, name, sep, layout string, value []time.Time, usage string) {
+	CommandLine.TimeSliceVar(p, name, sep, layout, value, usage)
+}
+func (f *FlagSet) TimeSlice(name, sep, layout string, value []time.Time, usage string) *[]time.Time {
+	p := new([]time.Time)
+	f.TimeSliceVar(p, name, sep, layout, value, usage)
+	return p
+}
+func TimeSlice(name, sep, layout string, value []time.Time, usage string) *[]time.Time {
+	return CommandLine.TimeSlice(name, sep, layout, value, usage)
+}
+
 func (f *FlagSet) StringMapVar(p *map[string]string, name string, value map[string]string, usage string) {
 	f.Var(newStringMapValue(value, p), name, usage)
 }
@@ -1114,6 +1209,7 @@ func (f *FlagSet) parseOne() (bool, error) {
 	if f.sources != nil {
 		f.sources[name] = "cli"
 	}
+	f.noteDeprecationIfNeeded(name)
 	return true, nil
 }
 
@@ -1286,6 +1382,244 @@ type FlagSet struct {
 	deferredValidations []func() error
 	required            map[string]struct{}
 	validationsDone     bool
+	deprecated          map[string]string   // flag -> replacement hint
+	deprecationNoted    map[string]struct{} // printed once per deprecated flag
+	// secretProvider kept for backwards compatibility with tests expecting this field.
+	// It can be wired to a pluggable secret source in future hot-reload work.
+	secretProvider interface{}
+
+	// change watch / hot reload
+	watchMu        sync.RWMutex
+	watcher        *fsnotify.Watcher
+	watchStopCh    chan struct{}
+	changeHandlers map[string][]func(string)
+	lastValues     map[string]string      // for diffing
+	watchPaths     map[string]watchTarget // paths we are watching (secret dir, config file)
+}
+
+type watchTarget struct {
+	path string
+	kind string // "secret-dir" or "config-file"
+}
+
+// OnChange registers a callback invoked when the named flag's value changes due to hot reload.
+// The callback receives the new string representation (masked not applied; caller should treat sensitive values carefully).
+func (f *FlagSet) OnChange(name string, fn func(string)) {
+	if fn == nil || name == "" {
+		return
+	}
+	f.watchMu.Lock()
+	defer f.watchMu.Unlock()
+	if f.changeHandlers == nil {
+		f.changeHandlers = make(map[string][]func(string))
+	}
+	f.changeHandlers[name] = append(f.changeHandlers[name], fn)
+}
+
+// OnChange adds a callback to the default FlagSet.
+func OnChange(name string, fn func(string)) { CommandLine.OnChange(name, fn) }
+
+// StartWatcher enables hot reload for the provided secret directory and/or config file.
+// Pass empty strings to skip either. It is safe to call multiple times; subsequent
+// calls update watched paths.
+func (f *FlagSet) StartWatcher(secretDir, configFile string) error {
+	f.watchMu.Lock()
+	defer f.watchMu.Unlock()
+	if f.watcher == nil {
+		w, err := fsnotify.NewWatcher()
+		if err != nil {
+			return err
+		}
+		f.watcher = w
+		f.watchStopCh = make(chan struct{})
+		go f.watchLoop()
+	}
+	if f.watchPaths == nil {
+		f.watchPaths = make(map[string]watchTarget)
+	}
+	// (Re)register paths
+	addPath := func(p, kind string) error {
+		if p == "" {
+			return nil
+		}
+		if _, ok := f.watchPaths[p]; ok {
+			return nil
+		} // already
+		if err := f.watcher.Add(p); err != nil {
+			return err
+		}
+		f.watchPaths[p] = watchTarget{path: p, kind: kind}
+		return nil
+	}
+	if err := addPath(secretDir, "secret-dir"); err != nil {
+		return err
+	}
+	if err := addPath(configFile, "config-file"); err != nil {
+		return err
+	}
+	// capture initial values for diffing
+	if f.lastValues == nil {
+		f.lastValues = make(map[string]string)
+	}
+	for name, fl := range f.formal {
+		f.lastValues[name] = fl.Value.String()
+	}
+	return nil
+}
+
+// StopWatcher stops hot reload watching.
+func (f *FlagSet) StopWatcher() error {
+	f.watchMu.Lock()
+	defer f.watchMu.Unlock()
+	if f.watcher == nil {
+		return nil
+	}
+	close(f.watchStopCh)
+	err := f.watcher.Close()
+	f.watcher = nil
+	f.watchPaths = nil
+	return err
+}
+
+// watchLoop listens for fsnotify events and triggers reload of affected layer(s).
+func (f *FlagSet) watchLoop() {
+	for {
+		select {
+		case <-f.watchStopCh:
+			return
+		case ev, ok := <-f.watcher.Events:
+			if !ok {
+				return
+			}
+			f.handleFsEvent(ev)
+		case err, ok := <-f.watcher.Errors:
+			if !ok {
+				return
+			}
+			_ = err // swallow; could log via a debug hook later
+		}
+	}
+}
+
+func (f *FlagSet) handleFsEvent(ev fsnotify.Event) {
+	f.watchMu.RLock()
+	paths := make(map[string]watchTarget, len(f.watchPaths))
+	for p, t := range f.watchPaths {
+		paths[p] = t
+	}
+	f.watchMu.RUnlock()
+	// Determine if event path or its parent (for secret dir file changes) is watched
+	for p, wt := range paths {
+		if wt.kind == "secret-dir" {
+			// any file within directory triggers secret refresh
+			if strings.HasPrefix(ev.Name, p) {
+				f.reloadSecrets(p)
+				break
+			}
+		} else if wt.kind == "config-file" {
+			if ev.Name == p {
+				f.reloadConfig(p)
+				break
+			}
+		}
+	}
+}
+
+func (f *FlagSet) reloadSecrets(dir string) {
+	f.watchMu.Lock()
+	defer f.watchMu.Unlock()
+	if err := f.ParseSecretDir(dir); err != nil {
+		return
+	}
+	f.diffAndDispatch()
+}
+
+func (f *FlagSet) reloadConfig(path string) {
+	f.watchMu.Lock()
+	defer f.watchMu.Unlock()
+	// re-parse file but only for flags not set by CLI/env; we simulate by clearing prior config sourced flags
+	for name, src := range f.sources {
+		if src == "config" {
+			delete(f.actual, name)
+			delete(f.sources, name)
+		}
+	}
+	if err := f.ParseFile(path); err != nil {
+		return
+	}
+	f.diffAndDispatch()
+}
+
+// diffAndDispatch compares current values to lastValues, updates lastValues, and invokes handlers.
+func (f *FlagSet) diffAndDispatch() {
+	if f.changeHandlers == nil {
+		return
+	}
+	for name, fl := range f.formal {
+		cur := fl.Value.String()
+		prev := f.lastValues[name]
+		if cur != prev {
+			f.lastValues[name] = cur
+			if hs := f.changeHandlers[name]; len(hs) > 0 {
+				for _, h := range hs {
+					func(cb func(string), v string) { defer func() { recover() }(); cb(v) }(h, cur)
+				}
+			}
+		}
+	}
+}
+
+// StartWatcher enables watching on default CommandLine FlagSet.
+func StartWatcher(secretDir, configFile string) error {
+	return CommandLine.StartWatcher(secretDir, configFile)
+}
+
+// StopWatcher stops watching on default CommandLine FlagSet.
+func StopWatcher() error { return CommandLine.StopWatcher() }
+
+// Deferred queues a validation or post-processing function executed by Validate() (or automatically after ParseStruct when AutoParse is true).
+// Use for custom handlers that need final values after all precedence layers.
+func (f *FlagSet) Deferred(fn func() error) {
+	if fn == nil {
+		return
+	}
+	f.deferredValidations = append(f.deferredValidations, fn)
+}
+
+// Deferred adds a function to the default CommandLine FlagSet's deferred validations.
+func Deferred(fn func() error) { CommandLine.Deferred(fn) }
+
+// Deprecate marks a flag as deprecated. If replacement is non-empty it is suggested.
+func (f *FlagSet) Deprecate(name, replacement string) {
+	if f.deprecated == nil {
+		f.deprecated = make(map[string]string)
+	}
+	f.deprecated[name] = replacement
+}
+
+// Deprecate global helper for default CommandLine set.
+func Deprecate(name, replacement string) { CommandLine.Deprecate(name, replacement) }
+
+func (f *FlagSet) noteDeprecationIfNeeded(name string) {
+	if f.deprecated == nil {
+		return
+	}
+	repl, ok := f.deprecated[name]
+	if !ok {
+		return
+	}
+	if f.deprecationNoted == nil {
+		f.deprecationNoted = make(map[string]struct{})
+	}
+	if _, seen := f.deprecationNoted[name]; seen {
+		return
+	}
+	f.deprecationNoted[name] = struct{}{}
+	msg := fmt.Sprintf("warning: flag -%s is deprecated", name)
+	if repl != "" {
+		msg += fmt.Sprintf(", use -%s instead", repl)
+	}
+	f.out().Write([]byte(msg + "\n"))
 }
 
 // MarkSensitive marks one or more flag names as sensitive causing their values
@@ -1424,7 +1758,11 @@ func Visit(fn func(*Flag)) {
 
 // Lookup returns the Flag structure of the named flag, returning nil if none exists.
 func (f *FlagSet) Lookup(name string) *Flag {
-	return f.formal[name]
+	fl := f.formal[name]
+	if fl != nil {
+		f.noteDeprecationIfNeeded(name)
+	}
+	return fl
 }
 
 // Lookup returns the Flag structure of the named command-line flag,
@@ -1447,6 +1785,7 @@ func (f *FlagSet) Set(name, value string) error {
 		f.actual = make(map[string]*Flag)
 	}
 	f.actual[name] = flag
+	f.noteDeprecationIfNeeded(name)
 	return nil
 }
 
@@ -1510,6 +1849,12 @@ func UnquoteUsage(flag *Flag) (name string, usage string) {
 		name = ""
 	case *durationValue:
 		name = "duration"
+	case *numberValue[int], *numberValue[int64]:
+		name = "int"
+	case *numberValue[uint], *numberValue[uint64]:
+		name = "uint"
+	case *numberValue[float64]:
+		name = "float"
 	case *float64Value:
 		name = "float"
 	case *intValue, *int64Value:
@@ -1673,13 +2018,13 @@ func Bool(name string, value bool, usage string) *bool {
 // IntVar defines an int flag with specified name, default value, and usage string.
 // The argument p points to an int variable in which to store the value of the flag.
 func (f *FlagSet) IntVar(p *int, name string, value int, usage string) {
-	f.Var(newIntValue(value, p), name, usage)
+	f.Var(newNumberValue[int](value, p), name, usage)
 }
 
 // IntVar defines an int flag with specified name, default value, and usage string.
 // The argument p points to an int variable in which to store the value of the flag.
 func IntVar(p *int, name string, value int, usage string) {
-	CommandLine.Var(newIntValue(value, p), name, usage)
+	CommandLine.Var(newNumberValue[int](value, p), name, usage)
 }
 
 // Int defines an int flag with specified name, default value, and usage string.
@@ -1699,13 +2044,13 @@ func Int(name string, value int, usage string) *int {
 // Int64Var defines an int64 flag with specified name, default value, and usage string.
 // The argument p points to an int64 variable in which to store the value of the flag.
 func (f *FlagSet) Int64Var(p *int64, name string, value int64, usage string) {
-	f.Var(newInt64Value(value, p), name, usage)
+	f.Var(newNumberValue[int64](value, p), name, usage)
 }
 
 // Int64Var defines an int64 flag with specified name, default value, and usage string.
 // The argument p points to an int64 variable in which to store the value of the flag.
 func Int64Var(p *int64, name string, value int64, usage string) {
-	CommandLine.Var(newInt64Value(value, p), name, usage)
+	CommandLine.Var(newNumberValue[int64](value, p), name, usage)
 }
 
 // Int64 defines an int64 flag with specified name, default value, and usage string.
@@ -1725,13 +2070,13 @@ func Int64(name string, value int64, usage string) *int64 {
 // UintVar defines a uint flag with specified name, default value, and usage string.
 // The argument p points to a uint variable in which to store the value of the flag.
 func (f *FlagSet) UintVar(p *uint, name string, value uint, usage string) {
-	f.Var(newUintValue(value, p), name, usage)
+	f.Var(newNumberValue[uint](value, p), name, usage)
 }
 
 // UintVar defines a uint flag with specified name, default value, and usage string.
 // The argument p points to a uint  variable in which to store the value of the flag.
 func UintVar(p *uint, name string, value uint, usage string) {
-	CommandLine.Var(newUintValue(value, p), name, usage)
+	CommandLine.Var(newNumberValue[uint](value, p), name, usage)
 }
 
 // Uint defines a uint flag with specified name, default value, and usage string.
@@ -1751,13 +2096,13 @@ func Uint(name string, value uint, usage string) *uint {
 // Uint64Var defines a uint64 flag with specified name, default value, and usage string.
 // The argument p points to a uint64 variable in which to store the value of the flag.
 func (f *FlagSet) Uint64Var(p *uint64, name string, value uint64, usage string) {
-	f.Var(newUint64Value(value, p), name, usage)
+	f.Var(newNumberValue[uint64](value, p), name, usage)
 }
 
 // Uint64Var defines a uint64 flag with specified name, default value, and usage string.
 // The argument p points to a uint64 variable in which to store the value of the flag.
 func Uint64Var(p *uint64, name string, value uint64, usage string) {
-	CommandLine.Var(newUint64Value(value, p), name, usage)
+	CommandLine.Var(newNumberValue[uint64](value, p), name, usage)
 }
 
 // Uint64 defines a uint64 flag with specified name, default value, and usage string.
@@ -1803,13 +2148,13 @@ func String(name string, value string, usage string) *string {
 // Float64Var defines a float64 flag with specified name, default value, and usage string.
 // The argument p points to a float64 variable in which to store the value of the flag.
 func (f *FlagSet) Float64Var(p *float64, name string, value float64, usage string) {
-	f.Var(newFloat64Value(value, p), name, usage)
+	f.Var(newNumberValue[float64](value, p), name, usage)
 }
 
 // Float64Var defines a float64 flag with specified name, default value, and usage string.
 // The argument p points to a float64 variable in which to store the value of the flag.
 func Float64Var(p *float64, name string, value float64, usage string) {
-	CommandLine.Var(newFloat64Value(value, p), name, usage)
+	CommandLine.Var(newNumberValue[float64](value, p), name, usage)
 }
 
 // Float64 defines a float64 flag with specified name, default value, and usage string.
