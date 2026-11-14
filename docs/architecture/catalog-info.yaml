@@ -1,0 +1,22 @@
+# flag (machship/flag), a fork of github.com/namsral/flag. See README.md in this folder.
+# Nothing here is deployed: the repo is a Go module that services import. No secret values.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: flag
+  description: MachShip fork of namsral/flag - a drop-in replacement for Go's flag package that layers command-line flags, environment variables, secret files and a config file, with struct-tag registration and validation
+  annotations:
+    github.com/project-slug: machship/flag
+spec:
+  type: library
+  owner: group:uplift
+  lifecycle: ga
+  machship:
+    lastReviewed: 2026-11-14
+    supportNote: >-
+      GitHub project-type Production, owner-team uplift. Forked from namsral/flag (upstream remote kept) and
+      extended in Sep 2025; MachShip tags v0.250902.01, v0.250902.1, v0.250905.1. The only importer found is
+      aiagent (archived), at v0.250905.1. About ten repos still import upstream github.com/namsral/flag v1.7.4-pre
+      directly, with no replace directive pointing at this fork. TODO(confirm) lifecycle: nothing live uses it.
+    publishes:
+    - {package: github.com/machship/flag, registry: "Go module proxy (private, fetched with GOPRIVATE=github.com/machship)"}

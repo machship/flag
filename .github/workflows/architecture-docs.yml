@@ -1,0 +1,7 @@
+name: architecture-docs
+on:
+  pull_request:
+    paths: ["docs/architecture/**"]
+jobs:
+  validate:
+    uses: machship/application-architecture/.github/workflows/validate-architecture-docs.yml@main
